@@ -135,6 +135,27 @@ class Port:
             device.check_error()
 
 
+def pulse_reset(session, p: Port, reset_pin, reset_delay_s: float, low_s: float = 0.02):
+    """Pulse the target's reset line low, release it to an input, then wait reset_delay_s.
+    Some targets (the ESP8266 is one) only answer on JTAG for a short window after reset."""
+    if reset_pin is None:
+        return
+    from . import digital
+    dd = session.device_data
+    (reset_pin,) = digital.check_pins(dd, [reset_pin], "reset_pin")
+    if reset_pin in (p.tck, p.tms, p.tdi, p.tdo):
+        raise AD2Error("reset_pin must differ from the JTAG pins")
+    if not 0 <= reset_delay_s <= 5:
+        raise AD2Error("reset_delay_s must be between 0 and 5 seconds")
+    digital.write(dd, low=[reset_pin])
+    import time
+    time.sleep(low_s)
+    digital.write(dd, inputs=[reset_pin])
+    time.sleep(reset_delay_s)
+    p.state = "reset"
+    p.reset()
+
+
 def port(session, tck_pin, tms_pin, tdi_pin, tdo_pin) -> Port:
     """Reuse the session's JTAG port when the pins match; otherwise set up a new one and reset the TAP."""
     dd = session.ensure()
@@ -218,13 +239,24 @@ def decode_idcode(code: int) -> dict:
     }
 
 
-def idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin) -> dict:
+def idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin, reset_pin=None, reset_delay_s=0.03,
+           instruction=None, ir_length=None) -> dict:
     """Reset the TAP (which selects IDCODE/BYPASS in every device) and read the DR chain.
-    Shifting ones in means the chain ends when 0xFFFFFFFF comes out."""
+    Shifting ones in means the chain ends when 0xFFFFFFFF comes out. With `instruction`, that
+    IR value is loaded first (single-device chains) for TAPs whose reset default is BYPASS."""
     if not 1 <= max_devices <= 32:
         raise AD2Error("max_devices must be between 1 and 32")
+    if (instruction is None) != (ir_length is None):
+        raise AD2Error("instruction and ir_length must be given together")
     p = port(session, tck_pin, tms_pin, tdi_pin, tdo_pin)
+    pulse_reset(session, p, reset_pin, reset_delay_s)
     p.reset()
+    if instruction is not None:
+        if not 1 <= ir_length <= 64:
+            raise AD2Error("ir_length must be between 1 and 64")
+        number = parse_value(instruction, ir_length)
+        p.goto("shift_ir")
+        p.shift(_int_to_bits(number, ir_length), "idle")
     p.goto("shift_dr")
     devices = []
     saw_one = False
@@ -253,10 +285,12 @@ def idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin) -> dict:
             **({"note": note} if note else {})}
 
 
-def count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=32) -> dict:
+def count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=32, reset_pin=None,
+                  reset_delay_s=0.03) -> dict:
     """Put every device in BYPASS (IR all ones), flush zeros through the chain, then shift ones
     and count how many clocks pass before the first one appears at TDO."""
     p = port(session, tck_pin, tms_pin, tdi_pin, tdo_pin)
+    pulse_reset(session, p, reset_pin, reset_delay_s)
     p.reset()
     p.goto("shift_ir")
     p.shift([1] * 128, "idle")                 # longer than any realistic total IR length
@@ -272,6 +306,58 @@ def count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=32) -
     if count is None:
         raise AD2Error("TDO never went high: no chain detected (or more devices than max_devices)")
     return {"count": count, "method": "bypass", "pins": {"tck": p.tck, "tms": p.tms, "tdi": p.tdi, "tdo": p.tdo}}
+
+
+def probe_instructions(session, ir_length, tck_pin, tms_pin, tdi_pin, tdo_pin, instructions=None,
+                       max_dr_length=64, reset_pin=None, reset_delay_s=0.03, window_s=0.35) -> dict:
+    """For each IR value, load it and measure the selected data register: its length (clocks until a
+    shifted-in one reappears) and its capture value. With reset_pin, the target is re-reset whenever
+    the post-reset window would run out. Single-device chains only."""
+    import time
+    if not 1 <= ir_length <= 32:
+        raise AD2Error("ir_length must be between 1 and 32")
+    if not 1 <= max_dr_length <= 1024:
+        raise AD2Error("max_dr_length must be between 1 and 1024")
+    if instructions is None:
+        instructions = list(range(1 << ir_length))
+    if len(instructions) > 256:
+        raise AD2Error("probe at most 256 instructions per call")
+    values = [parse_value(i, ir_length) for i in instructions]
+    p = port(session, tck_pin, tms_pin, tdi_pin, tdo_pin)
+    per_instruction = (ir_length + 2 * max_dr_length + 12) * 0.001   # rough bit-bang cost in seconds
+    results = []
+    window_start = None
+    for value in values:
+        if reset_pin is not None and (window_start is None or time.monotonic() - window_start + per_instruction > window_s):
+            pulse_reset(session, p, reset_pin, reset_delay_s)
+            window_start = time.monotonic()
+        p.goto("shift_ir")
+        ir_out = _bits_to_int(p.shift(_int_to_bits(value, ir_length), "idle"))
+        p.goto("shift_dr")
+        capture_bits = [p.clock(0, 0) for _ in range(max_dr_length)]
+        length = None
+        for i in range(max_dr_length + 1):
+            if p.clock(0, 1) == 1:
+                length = i
+                break
+        p.goto("idle")
+        entry = {"instruction": f"0x{value:0{(ir_length + 3) // 4}x}", "ir_capture": f"0x{ir_out:0{(ir_length + 3) // 4}x}"}
+        if length is None:
+            entry.update(dr_length=None, note=f"no response within {max_dr_length} bits (TDO stayed low)")
+        elif length == 0:
+            entry.update(dr_length=0, note="TDO high immediately: TDI appears to pass straight through, or TDO is stuck high")
+        else:
+            entry["dr_length"] = length
+            entry["capture_value"] = f"0x{_bits_to_int(capture_bits[:length]):0{(length + 3) // 4}x}"
+            if length == 1:
+                entry["note"] = "1-bit register (BYPASS or unused instruction)"
+            elif length == 32 and capture_bits[0] == 1:
+                entry["note"] = "32-bit register whose first bit is 1: looks like an IDCODE"
+                entry["as_idcode"] = decode_idcode(_bits_to_int(capture_bits[:32]))
+        results.append(entry)
+    lengths = sorted({r["dr_length"] for r in results if r["dr_length"]})
+    return {"ir_length": ir_length, "instructions": results, "distinct_dr_lengths": lengths,
+            "pins": {"tck": p.tck, "tms": p.tms, "tdi": p.tdi, "tdo": p.tdo}}
 
 
 def release(session) -> dict:

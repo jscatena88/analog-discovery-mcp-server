@@ -484,7 +484,8 @@ def stop_waveform(channel: int = 0) -> dict[str, Any]:
 
 @mcp.tool()
 def jtag_idcode(tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: int = 3,
-                max_devices: int = 8) -> dict[str, Any]:
+                max_devices: int = 8, reset_pin: int | None = None, reset_delay_s: float = 0.03,
+                instruction: int | str | None = None, ir_length: int | None = None) -> dict[str, Any]:
     """Reset the JTAG TAP and read the IDCODE of every device in the chain (bit-banged over four
     DIO pins). Each device reports its 32-bit IDCODE, JEDEC manufacturer, part number and version;
     devices without an IDCODE register are listed as BYPASS. TRST, if the target has one, must be
@@ -493,17 +494,48 @@ def jtag_idcode(tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: i
     Args:
         tck_pin, tms_pin, tdi_pin, tdo_pin: DIO pins wired to the target's TCK, TMS, TDI, TDO.
         max_devices: Stop after this many devices.
+        reset_pin: DIO pin on the target's reset line: pulse it low first and read reset_delay_s
+            after release. Needed for targets whose JTAG only answers shortly after reset.
+        reset_delay_s: Wait after releasing reset.
+        instruction, ir_length: Load this IR value before reading (single-device chains), for TAPs
+            whose reset default is BYPASS, e.g. Xtensa IDCODE 0x1e with ir_length 5.
     """
     with tool_errors():
-        return jtag.idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin)
+        return jtag.idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin, reset_pin, reset_delay_s,
+                           instruction, ir_length)
 
 
 @mcp.tool()
 def jtag_count_devices(tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: int = 3,
-                       max_devices: int = 32) -> dict[str, Any]:
-    """Count the devices in the JTAG chain using BYPASS (works even for devices without IDCODE)."""
+                       max_devices: int = 32, reset_pin: int | None = None,
+                       reset_delay_s: float = 0.03) -> dict[str, Any]:
+    """Count the devices in the JTAG chain using BYPASS (works even for devices without IDCODE).
+    reset_pin/reset_delay_s pulse the target's reset first, as for jtag_idcode."""
     with tool_errors():
-        return jtag.count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices)
+        return jtag.count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices, reset_pin, reset_delay_s)
+
+
+@mcp.tool()
+def jtag_probe_instructions(ir_length: int, tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2,
+                            tdo_pin: int = 3, instructions: list[int] | None = None, max_dr_length: int = 64,
+                            reset_pin: int | None = None, reset_delay_s: float = 0.03,
+                            window_s: float = 0.35) -> dict[str, Any]:
+    """Characterize an undocumented TAP: load each IR value and measure the data register it
+    selects (length in bits and capture value). 32-bit registers starting with a 1 are decoded as
+    IDCODEs. Single-device chains only. With reset_pin, the target is re-reset whenever the
+    post-reset window (window_s) would run out, so the whole table can be gathered from a
+    target that only answers briefly after reset.
+
+    Args:
+        ir_length: Instruction register length (find it from the IR capture pattern of jtag_scan).
+        tck_pin, tms_pin, tdi_pin, tdo_pin: Pin assignment.
+        instructions: IR values to try; default all 2 ** ir_length (at most 256 per call).
+        max_dr_length: Give up on a register longer than this.
+        reset_pin, reset_delay_s, window_s: Reset handling for windowed targets.
+    """
+    with tool_errors():
+        return jtag.probe_instructions(session, ir_length, tck_pin, tms_pin, tdi_pin, tdo_pin, instructions,
+                                       max_dr_length, reset_pin, reset_delay_s, window_s)
 
 
 @mcp.tool()

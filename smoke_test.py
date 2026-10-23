@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--diagnose", action="store_true", help="only run the analog wiring diagnosis")
     parser.add_argument("--configuration", type=int, default=0, help="firmware configuration to open")
     parser.add_argument("--jtag", metavar="TCK,TMS,TDI,TDO", help="DIO pins wired to a JTAG target: read its IDCODE chain")
+    parser.add_argument("--jtag-reset", type=int, metavar="PIN", help="DIO pin on the JTAG target's reset line (pulsed before each read)")
     args = parser.parse_args()
 
     if args.diagnose:
@@ -273,13 +274,14 @@ def main():
     @check("jtag target IDCODE", "jtag TCK,TMS,TDI,TDO", jtag_pins is not None)
     def _():
         tck, tms, tdi, tdo = jtag_pins
-        pins = dict(tck_pin=tck, tms_pin=tms, tdi_pin=tdi, tdo_pin=tdo)
+        pins = dict(tck_pin=tck, tms_pin=tms, tdi_pin=tdi, tdo_pin=tdo, reset_pin=args.jtag_reset)
         count = call("jtag_count_devices", **pins)["count"]
         ids = call("jtag_idcode", **pins)
         call("jtag_release")
         expect(ids["count"] >= 1, ids.get("note", "no devices"))
-        parts = ", ".join(f"{d.get('idcode', 'bypass')} {d.get('manufacturer', '')}".strip() for d in ids["devices"])
-        return f"{count} device(s) by BYPASS, IDCODEs: {parts}"
+        parts = ", ".join(f"{d.get('idcode') or 'no IDCODE (BYPASS default)'} {d.get('manufacturer', '')}".strip()
+                          for d in ids["devices"])
+        return f"{count} device(s) by BYPASS; {parts}"
 
     @check("disconnect_device")
     def _():

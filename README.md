@@ -265,11 +265,17 @@ The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wir
 
 The WaveForms SDK has no JTAG engine, so these tools drive TCK/TMS/TDI as static outputs and sample TDO, at a few milliseconds per bit. That is enough for identification, boundary-scan experiments and small register accesses, not for programming. Pins default to TCK=DIO0, TMS=DIO1, TDI=DIO2, TDO=DIO3 and can be any four distinct pins; the target's TRST (if any) must be released externally.
 
-- **`jtag_idcode(tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=8)`** resets the TAP and reads every device's 32-bit IDCODE with JEDEC manufacturer, part number and version; devices without an IDCODE register appear as BYPASS.
-- **`jtag_count_devices(...)`** counts the chain using BYPASS.
+- **`jtag_idcode(tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=8, reset_pin?, reset_delay_s=0.03, instruction?, ir_length?)`** resets the TAP and reads every device's 32-bit IDCODE with JEDEC manufacturer, part number and version; devices without an IDCODE register appear as BYPASS. `reset_pin` pulses the target's reset first, for chips whose JTAG only answers for a short window after reset. `instruction`/`ir_length` load a specific IR value first for TAPs whose reset default is BYPASS.
+- **`jtag_count_devices(..., reset_pin?)`** counts the chain using BYPASS.
+- **`jtag_probe_instructions(ir_length, ..., instructions?, max_dr_length=64, reset_pin?, window_s=0.35)`** characterizes an undocumented TAP: for every IR value it reports the selected data register's length and capture value, flagging IDCODE-like registers. With `reset_pin` it re-resets the target whenever the post-reset window would run out.
 - **`jtag_scan(register, length, value?, end_state="idle", ...)`** shifts a value through the IR or DR (LSB first) and returns what came out; chain an IR scan and a DR scan to use an instruction.
 - **`jtag_tap_state(state, ...)`** walks the TAP state machine along the shortest TMS path and reports the sequence.
 - **`jtag_release`** returns the pins to inputs.
+
+Example: an ESP8266 (GPIO13=TCK, GPIO14=TMS, GPIO12=TDI, GPIO15=TDO, plus its reset line) only answers on JTAG for about 400 ms after reset, has a 5-bit IR with capture value 0x01, no IDCODE, and data registers of 24, 32, 8 and 8 bits behind instructions 0x16-0x19:
+```
+jtag_probe_instructions {"ir_length": 5, "tck_pin": 1, "tms_pin": 3, "tdi_pin": 2, "tdo_pin": 0, "reset_pin": 4}
+```
 
 ### Analysis (spectrum, network and impedance analyzers)
 

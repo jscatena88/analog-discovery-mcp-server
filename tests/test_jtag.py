@@ -77,6 +77,34 @@ def test_tap_state_walk_and_release(server, tap, fake_dwf):
     assert call_tool(server, "jtag_release") == {"released": False}
 
 
+def test_idcode_with_explicit_instruction_and_reset_pin(server, tap, fake_dwf):
+    out = call_tool(server, "jtag_idcode", instruction="0xE", ir_length=4, reset_pin=9, reset_delay_s=0.0, **PINS)
+    assert out["count"] == 1 and out["devices"][0]["idcode"] == "0x4ba00477"
+    assert tap.ir == 0b1110
+    # the reset pin was driven low, then released to an input
+    writes = [(a[1].value) for a in fake_dwf.calls_to("FDwfDigitalIOOutputEnableSet")]
+    assert any(w & (1 << 9) for w in writes) and not (fake_dwf.dio_output_enable & (1 << 9))
+    with pytest.raises(RuntimeError, match="given together"):
+        call_tool(server, "jtag_idcode", instruction=1, **PINS)
+    with pytest.raises(RuntimeError, match="differ from the JTAG pins"):
+        call_tool(server, "jtag_idcode", reset_pin=4, **PINS)
+
+
+def test_probe_instructions_maps_registers(server, tap):
+    out = call_tool(server, "jtag_probe_instructions", ir_length=4, max_dr_length=40, **PINS)
+    assert out["ir_length"] == 4 and len(out["instructions"]) == 16
+    assert out["distinct_dr_lengths"] == [1, 32]
+    idcode_entry = out["instructions"][0xE]
+    assert idcode_entry["dr_length"] == 32 and idcode_entry["capture_value"] == "0x4ba00477"
+    assert idcode_entry["as_idcode"]["manufacturer"] == "ARM"
+    bypass_entry = out["instructions"][0xF]
+    assert bypass_entry["dr_length"] == 1 and "BYPASS" in bypass_entry["note"]
+    assert all(e["ir_capture"] == "0x1" for e in out["instructions"])
+    out = call_tool(server, "jtag_probe_instructions", ir_length=4, instructions=[0xE], reset_pin=9,
+                    reset_delay_s=0.0, **PINS)
+    assert out["instructions"][0]["dr_length"] == 32
+
+
 def test_pin_validation(server):
     with pytest.raises(RuntimeError, match="all be different"):
         call_tool(server, "jtag_idcode", tck_pin=1, tms_pin=1)
