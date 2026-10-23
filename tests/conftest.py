@@ -20,19 +20,23 @@ if ROOT not in sys.path:
 def pytest_addoption(parser):
     parser.addoption("--hardware", action="store_true", default=False,
                      help="run tests that need a connected Analog Discovery 2")
+    parser.addoption("--jumpered", action="store_true", default=False,
+                     help="also run hardware tests that need jumpers DIO0->8, DIO1->9, DIO2->10, T1->DIO15")
 
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "hardware: needs a connected Analog Discovery 2")
+    config.addinivalue_line("markers", "jumpered: needs loopback jumpers on the device")
 
 
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--hardware"):
-        return
-    skip = pytest.mark.skip(reason="needs --hardware and a connected Analog Discovery 2")
+    skip_hw = pytest.mark.skip(reason="needs --hardware and a connected Analog Discovery 2")
+    skip_jumper = pytest.mark.skip(reason="needs --jumpered and loopback jumpers (see test_hardware.py)")
     for item in items:
-        if "hardware" in item.keywords:
-            item.add_marker(skip)
+        if "hardware" in item.keywords and not config.getoption("--hardware"):
+            item.add_marker(skip_hw)
+        elif "jumpered" in item.keywords and not config.getoption("--jumpered"):
+            item.add_marker(skip_jumper)
 
 
 def _fill(buf, text):
@@ -74,6 +78,14 @@ class FakeDwf:
         self.dio_external = 0
         # logic analyzer sample i: DIO0 toggles every 50 samples (1 MHz at 100 MS/s), DIO1 held high
         self.logic_pattern = lambda i: ((i // 50) & 1) | 0b10
+        # UART: transmitted bytes loop back into the receive queue
+        self.uart_queue = bytearray()
+        self.uart_tx_log = []
+        # I2C: one fake slave at 0x1D holding 16 bytes of "registers"
+        self.i2c_bus_free = 1
+        self.i2c_devices = {0x1D: bytearray(range(16))}
+        self.i2c_writes = []
+        self.i2c_spy_fragments = []     # (start, stop, bytes, nak) tuples handed out in order
 
     def calls_to(self, name):
         return [args for called, args in self.calls if called == name]
@@ -178,6 +190,74 @@ class FakeDwf:
     def _h_DigitalInStatusData(self, h, buf, nbytes):
         for i in range(nbytes.value // 2):
             buf[i] = self.logic_pattern(i)
+
+    # UART (loopback)
+    def _h_DigitalUartTx(self, h, buf, n):
+        if buf is None:
+            return
+        data = bytes(buf[:n.value])
+        self.uart_tx_log.append(data)
+        self.uart_queue += data
+
+    def _h_DigitalUartRx(self, h, buf, n, count, parity):
+        _set(parity, 0)
+        if buf is None:
+            self.uart_queue.clear()
+            _set(count, 0)
+            return
+        take = min(n.value, len(self.uart_queue))
+        for i in range(take):
+            buf[i] = self.uart_queue[i]
+        del self.uart_queue[:take]
+        _set(count, take)
+
+    # SPI (MOSI looped back to MISO)
+    def _h_DigitalSpiWriteRead(self, h, dq, bits, tx, ntx, rx, nrx):
+        for i in range(nrx.value):
+            rx[i] = tx[i] if i < ntx.value else 0
+
+    # I2C
+    def _h_DigitalI2cClear(self, h, free): _set(free, self.i2c_bus_free)
+
+    def _h_DigitalI2cWrite(self, h, addr, tx, n, nak):
+        address = addr.value >> 1
+        if address not in self.i2c_devices:
+            _set(nak, 1)
+            return
+        data = bytes(tx[:n.value]) if tx is not None and n.value else b""
+        self.i2c_writes.append((address, data))
+        _set(nak, 0)
+
+    def _h_DigitalI2cRead(self, h, addr, rx, n, nak):
+        address = addr.value >> 1
+        if address not in self.i2c_devices:
+            _set(nak, 1)
+            return
+        memory = self.i2c_devices[address]
+        for i in range(n.value):
+            rx[i] = memory[i % len(memory)]
+        _set(nak, 0)
+
+    def _h_DigitalI2cWriteRead(self, h, addr, tx, ntx, rx, nrx, nak):
+        address = addr.value >> 1
+        if address not in self.i2c_devices:
+            _set(nak, 1)
+            return
+        memory = self.i2c_devices[address]
+        register = tx[0]
+        for i in range(nrx.value):
+            rx[i] = memory[(register + i) % len(memory)]
+        _set(nak, 0)
+
+    def _h_DigitalI2cSpyStatus(self, h, start, stop, data, count, nak):
+        if self.i2c_spy_fragments:
+            f_start, f_stop, payload, f_nak = self.i2c_spy_fragments.pop(0)
+        else:
+            f_start, f_stop, payload, f_nak = 0, 0, b"", 0
+        _set(start, f_start); _set(stop, f_stop); _set(nak, f_nak)
+        for i, b in enumerate(payload):
+            data._obj[i] = b
+        _set(count, len(payload))
 
     # scope acquisition
     def _h_AnalogInFrequencySet(self, h, f): self.sample_rate = f.value

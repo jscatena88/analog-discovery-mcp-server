@@ -1,6 +1,8 @@
 """Smoke tests against a real Analog Discovery 2. Run with: uv run pytest --hardware
 
-Nothing needs to be wired to the device. Scope readings are only checked for sanity.
+Most tests need nothing wired. The protocol and external-trigger tests (marked `jumpered`)
+expect these jumpers: DIO0->DIO8, DIO1->DIO9, DIO2->DIO10 and T1->DIO15; run them with
+`uv run pytest --hardware --jumpered`.
 """
 
 import os
@@ -100,6 +102,67 @@ def test_custom_pattern_bit_rate(hw):
     out = call_tool(hw, "capture_logic", pins=[3], sampling_frequency=10e6, trigger_pin=3, save_csv=False)
     assert abs(out["pins"]["dio3"]["frequency_hz_estimate"] - 125e3) < 2e3
     call_tool(hw, "stop_pattern", channel=3)
+
+
+jumpered = pytest.mark.jumpered
+
+
+@jumpered
+def test_uart_loopback(hw):
+    out = call_tool(hw, "uart_send", data="Hello AD2\r\n", tx_pin=0, rx_pin=8, baud_rate=115200)
+    assert out["received"]["text"] == "Hello AD2\r\n"
+    assert out["stop_reason"] == "idle" and out["parity_errors"] == 0
+    out = call_tool(hw, "uart_send", data="00 ff 55 aa", data_format="hex", tx_pin=0, rx_pin=8,
+                    baud_rate=9600, parity="even", stop_bits=2)
+    assert out["received"]["hex"] == "00 ff 55 aa"
+    call_tool(hw, "uart_send", data="buffered", tx_pin=0, rx_pin=8, baud_rate=9600, parity="even",
+              stop_bits=2, receive_timeout_s=0)
+    out = call_tool(hw, "uart_receive", tx_pin=0, rx_pin=8, baud_rate=9600, parity="even", stop_bits=2,
+                    timeout_s=1.0)
+    assert out["received"]["text"] == "buffered"
+
+
+@jumpered
+def test_spi_loopback(hw):
+    for mode in (0, 1, 2, 3):
+        out = call_tool(hw, "spi_transfer", write="a5 01 ff 00 3c", clock_pin=1, mosi_pin=0, miso_pin=8,
+                        select_pin=2, frequency=1e6, mode=mode)
+        assert out["read"]["hex"] == "a5 01 ff 00 3c", f"mode {mode}"
+    out = call_tool(hw, "spi_transfer", write=list(range(256)), read_count=300, clock_pin=1, mosi_pin=0,
+                    miso_pin=8, select_pin=2, frequency=5e6, fill_byte=0x5A)
+    assert out["read"]["bytes"] == list(range(256)) + [0x5A] * 44
+
+
+@jumpered
+def test_i2c_without_pullups_reports_bus_not_free(hw):
+    with pytest.raises(RuntimeError, match="pull-up"):
+        call_tool(hw, "i2c_scan", scl_pin=3, sda_pin=4)
+
+
+@jumpered
+def test_external_trigger_from_t1(hw):
+    call_tool(hw, "generate_pattern", channel=15, kind="clock", frequency=1e3)
+    out = call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=1e6, trigger_source="external1",
+                    trigger_timeout_s=0, max_wait_s=2.0, save_csv=False)
+    assert out["trigger"]["source"] == "external1" and out["samples_per_channel"] == 8192
+    with pytest.raises(RuntimeError, match="did not complete within 0.5"):
+        call_tool(hw, "capture_waveform", channels=[1], trigger_source="external2", trigger_timeout_s=0,
+                  max_wait_s=0.5, save_csv=False)
+    call_tool(hw, "stop_pattern")
+    # Releasing the pin lets it float, which can produce one spurious edge on T1; hold it low instead.
+    call_tool(hw, "write_digital_pins", low=[15])
+    with pytest.raises(RuntimeError, match="did not complete within 0.5"):
+        call_tool(hw, "capture_waveform", channels=[1], trigger_source="external1", trigger_timeout_s=0,
+                  max_wait_s=0.5, save_csv=False)
+    call_tool(hw, "write_digital_pins", inputs=[15])
+
+
+def test_wavegen_trigger_source(hw):
+    call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
+    out = call_tool(hw, "capture_waveform", channels=[1], trigger_source="wavegen1", trigger_timeout_s=0,
+                    max_wait_s=2.0, save_csv=False)
+    assert out["samples_per_channel"] == 8192
+    call_tool(hw, "stop_waveform")
 
 
 def test_power_supplies_round_trip(hw):

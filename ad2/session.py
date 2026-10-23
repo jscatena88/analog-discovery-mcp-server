@@ -87,6 +87,10 @@ class Session:
         self.device_name = None
         self.scope_settings = None      # (sampling_frequency, buffer_size, range, offset) in effect
         self.logic_settings = None      # (divider, buffer_size) in effect
+        self.uart_settings = None       # (tx, rx, baud, bits, parity, stop) in effect
+        self.uart_tx_ready = False      # TX line initialized (driven idle-high)
+        self.spi_settings = None
+        self.i2c_settings = None        # (scl, sda, rate) in effect
         self.wavegen_running = set()    # channels with an active output
         self.pattern_running = set()    # DIO pins driven by the pattern generator
 
@@ -132,6 +136,9 @@ class Session:
                          lambda: wf_wavegen.close(dd, 0),
                          lambda: device.dwf.FDwfDigitalOutReset(dd.handle),
                          lambda: device.dwf.FDwfDigitalInReset(dd.handle),
+                         lambda: device.dwf.FDwfDigitalUartReset(dd.handle),
+                         lambda: device.dwf.FDwfDigitalSpiReset(dd.handle),
+                         lambda: device.dwf.FDwfDigitalI2cReset(dd.handle),
                          lambda: digital.reset(dd),
                          lambda: analogio.disable_supplies(dd, settle=False),
                          lambda: device.close(dd)):
@@ -142,6 +149,10 @@ class Session:
         self.device_data = None
         self.scope_settings = None
         self.logic_settings = None
+        self.uart_settings = None
+        self.uart_tx_ready = False
+        self.spi_settings = None
+        self.i2c_settings = None
         self.wavegen_running = set()
         self.pattern_running = set()
 

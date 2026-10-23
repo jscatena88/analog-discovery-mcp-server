@@ -12,6 +12,10 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **Static digital I/O**: read all 16 DIO pins, drive pins high/low, release them to input
 - **Pattern generator**: clocks up to 50 MHz, pulses with duty cycle, custom bit streams and random data on any DIO pin, with burst control
 - **Logic analyzer**: 16-channel capture up to 100 MS/s with edge trigger and pre-trigger, per-pin transition/frequency summaries, and the full record saved as CSV
+- **UART**: send with reply capture, or listen-only, on any two DIO pins
+- **SPI master**: full-duplex transfers on any four DIO pins, modes 0-3, 1-8 bit words
+- **I2C master and spy**: address scan, write, read, write-then-read, and passive bus decoding (external pull-ups required)
+- **External triggers**: T1/T2 usable as scope trigger sources
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -210,6 +214,20 @@ The result reports the frequency actually produced. **`stop_pattern(channel?)`**
 
 Per pin the result gives `initial_level`, `final_level`, `transitions`, `high_fraction`, `frequency_hz_estimate` and `edges` as `[time_s, new_level]` pairs; `active_pins` lists the pins that toggled. The CSV has a column per pin plus the raw 16-bit value.
 
+### Protocols (UART, SPI, I2C)
+
+The protocol engines run on any DIO pins; pick pins that are not in use by the pattern generator or static I/O.
+
+**`uart_send(data, data_format="text", tx_pin=0, rx_pin=1, baud_rate=9600, data_bits=8, parity="none", stop_bits=1, receive_timeout_s=0.5)`** transmits and collects the reply, returning early once the reply goes quiet. `data_format` is `text` (UTF-8) or `hex` (`"01 ab ff"`). Received data comes back as text, hex and a byte list.
+
+**`uart_receive(rx_pin=1, tx_pin=0, ..., timeout_s=2, idle_timeout_s=0.2, max_bytes=8192)`** listens without transmitting (the engine still reserves a TX pin; pick an unused one). Bytes received since the last UART call are included.
+
+**`spi_transfer(write?, read_count=0, clock_pin=1, mosi_pin=2, miso_pin=3, select_pin=0, frequency=1e6, mode=0, msb_first=true, bits_per_word=8, fill_byte=0)`** clocks `max(len(write), read_count)` words inside one select assertion and returns what came back on MISO. Words wider than 8 bits are not supported yet.
+
+**`i2c_scan(scl_pin=0, sda_pin=1, rate=100e3, first=0x08, last=0x77)`** lists the addresses that acknowledge. **`i2c_write(address, data, ...)`**, **`i2c_read(address, count, ...)`** and **`i2c_write_read(address, data, count, ...)`** (write then repeated-start read, the usual register read) report `acknowledged`, the NAK position and the bytes transferred. Addresses are 7-bit and not pre-shifted. **`i2c_spy(duration_s=2, max_messages=100, ...)`** passively decodes traffic between other devices into messages with address, direction, data and NAK/stop flags.
+
+The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wiring hint instead of returning garbage.
+
 ## Usage Examples
 
 ### Basic Workflow
@@ -223,7 +241,10 @@ Per pin the result gives `initial_level`, `final_level`, `transitions`, `high_fr
 6. **Check the DC level on channel 2**: `measure_voltage {"channel": 2}`
 7. **Put a 1 MHz clock on DIO 0 and look at it**: `generate_pattern {"channel": 0, "kind": "clock", "frequency": 1000000}` then `capture_logic {"pins": [0], "trigger_pin": 0, "pretrigger_samples": 100}`
 8. **Toggle a reset line**: `write_digital_pins {"low": [5]}` ... `write_digital_pins {"high": [5]}`
-9. **Shut everything down**: `disconnect_device`
+9. **Talk to a serial console on DIO 4/5 at 115200**: `uart_send {"data": "help\r\n", "tx_pin": 4, "rx_pin": 5, "baud_rate": 115200}`
+10. **Read a SPI flash ID** (CS DIO0, SCK DIO1, MOSI DIO2, MISO DIO3): `spi_transfer {"write": "9f", "read_count": 4}`
+11. **Find I2C devices and read a register**: `i2c_scan {}` then `i2c_write_read {"address": 104, "data": "75", "count": 1}`
+12. **Shut everything down**: `disconnect_device`
 
 To use the 16k-sample scope buffer, call `connect_device {"configuration": 1}` first.
 
@@ -277,7 +298,7 @@ This will test device connection, oscilloscope capture, and waveform generation.
 - **Packaging**: `pyproject.toml` + `uv.lock`, virtual environment managed by `uv`
 - **Python Library**: Uses `WF_SDK` wrapper from [Digilent's official WaveForms SDK Getting Started examples](https://github.com/Digilent/WaveForms-SDK-Getting-Started-PY)
 - **Device**: Digilent Analog Discovery 2
-- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor, static digital I/O, pattern generator, logic analyzer
+- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor, static digital I/O, pattern generator, logic analyzer, UART, SPI master, I2C master and spy
 - **Layout**: `server.py` registers the tools; `ad2/` holds one module per instrument on top of `WF_SDK/`
 - **Local WF_SDK patches**: macOS framework path fallback, and skipping digital buffer queries in firmware configurations that have no digital channels (otherwise `connect_device` with configuration 1 or 2 fails)
 - **Note**: Channels are 1-indexed (1-2) as per WF_SDK convention
@@ -295,6 +316,10 @@ uv run pytest
 With an Analog Discovery 2 attached, add the hardware smoke tests. They briefly enable the supplies and the generator with nothing connected to the device.
 ```bash
 uv run pytest --hardware
+```
+The protocol and external-trigger tests additionally need loopback jumpers (DIO0 to DIO8, DIO1 to DIO9, DIO2 to DIO10, and T1 to DIO15):
+```bash
+uv run pytest --hardware --jumpered
 ```
 `test_device.py` remains as a standalone check of the vendored WF_SDK wrapper.
 

@@ -80,7 +80,9 @@ def capture(session, channels=None, sampling_frequency=20e6, buffer_size=0, rang
     _set_trigger(dd, trigger_source, trigger_level, trigger_edge, trigger_timeout_s)
 
     dwf = wf_scope.dwf
-    if dwf.FDwfAnalogInConfigure(dd.handle, ctypes.c_bool(False), ctypes.c_bool(True)) == 0:
+    # reconfigure=True pushes the trigger settings to the device before arming; without it,
+    # external and cross-instrument trigger sources never fire on the AD2.
+    if dwf.FDwfAnalogInConfigure(dd.handle, ctypes.c_bool(True), ctypes.c_bool(True)) == 0:
         device.check_error()
     deadline = time.monotonic() + max_wait_s
     status = ctypes.c_byte()

@@ -19,7 +19,7 @@ except (ImportError, OSError) as e:
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
-from ad2 import analogio, analysis, digital, export, logic, pattern, scope, wavegen
+from ad2 import analogio, analysis, bytesutil, digital, export, i2c, logic, pattern, scope, spi, uart, wavegen
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
@@ -40,6 +40,10 @@ Instruments exposed:
   (capture_logic: 16 pins, up to 100 MS/s, 4096 samples by default, 16384 with configuration 3).
   A pin driven by the pattern generator overrides its static level. The logic analyzer reads
   back pins the device itself is driving, so loopback tests need no wiring.
+- Protocol engines on any DIO pins: UART (uart_send, uart_receive), SPI master (spi_transfer,
+  8-bit words), I2C master (i2c_scan, i2c_write, i2c_read, i2c_write_read) and I2C bus spy
+  (i2c_spy). I2C needs external pull-up resistors on SDA and SCL; the device has none.
+- Trigger inputs T1/T2 are usable as capture_waveform trigger_source external1/external2.
 
 Workflow: tools auto-connect to the first device on first use; call connect_device only to pick a
 specific device or firmware configuration. capture_waveform and capture_logic return summary
@@ -384,6 +388,162 @@ def capture_logic(
             "pins": summaries,
             "csv_path": path,
         }
+
+
+# --------------------------------------------------------------------------- UART
+
+@mcp.tool()
+def uart_send(
+    data: str,
+    data_format: str = "text",
+    tx_pin: int = 0,
+    rx_pin: int = 1,
+    baud_rate: float = 9600,
+    data_bits: int = 8,
+    parity: str = "none",
+    stop_bits: float = 1.0,
+    receive_timeout_s: float = 0.5,
+) -> dict[str, Any]:
+    """Transmit bytes on tx_pin and collect whatever arrives on rx_pin for receive_timeout_s
+    (stopping early once the reply goes quiet). Bytes that arrived before the send are discarded.
+
+    Args:
+        data: Text, or hex bytes such as "01 ab ff" when data_format is "hex".
+        data_format: "text" (UTF-8) or "hex".
+        tx_pin: DIO pin driven as TX (idle high).
+        rx_pin: DIO pin sampled as RX.
+        baud_rate: Bits per second, e.g. 9600 or 115200.
+        data_bits: 5 to 8.
+        parity: none, even, odd, mark or space.
+        stop_bits: 1, 1.5 or 2.
+        receive_timeout_s: How long to wait for a reply; 0 sends without listening.
+    """
+    with tool_errors():
+        payload = bytesutil.parse_text_or_hex(data, data_format)
+        return uart.send(session, payload, tx_pin, rx_pin, baud_rate, data_bits, parity, stop_bits,
+                         receive_timeout_s)
+
+
+@mcp.tool()
+def uart_receive(
+    rx_pin: int = 1,
+    tx_pin: int = 0,
+    baud_rate: float = 9600,
+    data_bits: int = 8,
+    parity: str = "none",
+    stop_bits: float = 1.0,
+    timeout_s: float = 2.0,
+    idle_timeout_s: float = 0.2,
+    max_bytes: int = 8192,
+) -> dict[str, Any]:
+    """Listen on rx_pin without transmitting (serial spy / console capture). Returns once max_bytes
+    arrive, once data stops for idle_timeout_s, or after timeout_s. Bytes received since the last
+    UART call are included. The TX pin is reserved but not driven unless uart_send is used.
+
+    Args:
+        rx_pin: DIO pin to listen on.
+        tx_pin: Any unused DIO pin (the engine requires one).
+        baud_rate, data_bits, parity, stop_bits: Line settings, as for uart_send.
+        timeout_s: Maximum wait, up to 60 s.
+        idle_timeout_s: Return after this much silence following data; 0 waits for timeout_s.
+        max_bytes: Stop after this many bytes.
+    """
+    with tool_errors():
+        return uart.receive(session, tx_pin, rx_pin, baud_rate, data_bits, parity, stop_bits,
+                            timeout_s, idle_timeout_s, max_bytes)
+
+
+# --------------------------------------------------------------------------- SPI
+
+@mcp.tool()
+def spi_transfer(
+    write: str | list[int] | None = None,
+    read_count: int = 0,
+    clock_pin: int = 1,
+    mosi_pin: int = 2,
+    miso_pin: int = 3,
+    select_pin: int = 0,
+    frequency: float = 1e6,
+    mode: int = 0,
+    msb_first: bool = True,
+    bits_per_word: int = 8,
+    fill_byte: int = 0,
+) -> dict[str, Any]:
+    """SPI master full-duplex transfer: select asserted, max(len(write), read_count) words clocked
+    out while the same number are read back, select released. Words wider than 8 bits are not
+    supported yet.
+
+    Args:
+        write: Bytes to send as hex ("9f 00 00") or a list of ints; padded with fill_byte when
+            read_count is larger.
+        read_count: Minimum number of words to clock (and read back).
+        clock_pin, mosi_pin, miso_pin, select_pin: DIO pin assignments.
+        frequency: SCK frequency in Hz.
+        mode: SPI mode 0-3 (CPOL/CPHA).
+        msb_first: Bit order.
+        bits_per_word: 1 to 8.
+        fill_byte: Value sent while only reading.
+    """
+    with tool_errors():
+        return spi.transfer(session, write, read_count, bits_per_word, fill_byte, clock_pin, mosi_pin,
+                            miso_pin, select_pin, frequency, mode, msb_first, True)
+
+
+# --------------------------------------------------------------------------- I2C
+
+@mcp.tool()
+def i2c_scan(scl_pin: int = 0, sda_pin: int = 1, rate: float = 100e3,
+             first: int = 0x08, last: int = 0x77) -> dict[str, Any]:
+    """Probe every 7-bit address in [first, last] and list the ones that acknowledge. Fails with a
+    wiring hint if SDA or SCL is held low (missing pull-ups or unpowered slave).
+
+    Args:
+        scl_pin, sda_pin: DIO pins for clock and data.
+        rate: Bus clock in Hz (100e3 standard, 400e3 fast).
+        first, last: Address range to scan.
+    """
+    with tool_errors():
+        return i2c.scan(session, scl_pin, sda_pin, rate, first, last)
+
+
+@mcp.tool()
+def i2c_write(address: int, data: str | list[int], scl_pin: int = 0, sda_pin: int = 1,
+              rate: float = 100e3) -> dict[str, Any]:
+    """Write bytes to a 7-bit I2C address. The result says whether every byte was acknowledged.
+
+    Args:
+        address: 7-bit address (0x00-0x7F), not pre-shifted.
+        data: Bytes as hex ("00 ff") or a list of ints; may be empty to only address the device.
+        scl_pin, sda_pin, rate: Bus settings.
+    """
+    with tool_errors():
+        return i2c.write(session, address, data, scl_pin, sda_pin, rate)
+
+
+@mcp.tool()
+def i2c_read(address: int, count: int, scl_pin: int = 0, sda_pin: int = 1,
+             rate: float = 100e3) -> dict[str, Any]:
+    """Read count bytes from a 7-bit I2C address."""
+    with tool_errors():
+        return i2c.read(session, address, count, scl_pin, sda_pin, rate)
+
+
+@mcp.tool()
+def i2c_write_read(address: int, data: str | list[int], count: int, scl_pin: int = 0,
+                   sda_pin: int = 1, rate: float = 100e3) -> dict[str, Any]:
+    """Write bytes (typically a register number) then read count bytes after a repeated start,
+    the usual way to read a register from a sensor."""
+    with tool_errors():
+        return i2c.write_read(session, address, data, count, scl_pin, sda_pin, rate)
+
+
+@mcp.tool()
+def i2c_spy(duration_s: float = 2.0, max_messages: int = 100, scl_pin: int = 0, sda_pin: int = 1,
+            rate: float = 100e3) -> dict[str, Any]:
+    """Passively decode I2C traffic between other devices on the bus for duration_s seconds.
+    Each message has the address, direction, data bytes, NAK position and stop flag."""
+    with tool_errors():
+        return i2c.spy(session, scl_pin, sda_pin, rate, duration_s, max_messages)
 
 
 if __name__ == "__main__":
