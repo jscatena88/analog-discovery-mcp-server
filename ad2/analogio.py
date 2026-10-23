@@ -107,16 +107,27 @@ def supplies_status(dd) -> dict:
     """Setpoints (enabled, voltage_setpoint_v) and measured values (active, voltage_v, current_a)."""
     _refresh(dd)
 
+    def measurable(label, node_name):
+        loc = find_node(dd, label, node_name)
+        return loc is not None and dd.analog.IO.max_read_range[loc[0]][loc[1]] > 0
+
     def rail(label):
         enabled = _get_setpoint(dd, label, "Enable")
         active = _get(dd, label, "Enable")
-        return {
+        out = {
             "enabled": None if enabled is None else bool(enabled),
             "voltage_setpoint_v": _get_setpoint(dd, label, "Voltage"),
             "active": None if active is None else bool(active),
             "voltage_v": _get(dd, label, "Voltage"),
-            "current_a": _get(dd, label, "Current"),
         }
+        # The AD2 cannot measure supply current (the node's readable range is 0); its status value
+        # is just the limit setting. Report a measurement only where the device can make one.
+        if measurable(label, "Current"):
+            out["current_a"] = _get(dd, label, "Current")
+        else:
+            out["current_a"] = None
+            out["current_note"] = "not measurable on this device; use the USB current in get_system_status"
+        return out
 
     return {
         "master_enabled": master_enabled(dd),

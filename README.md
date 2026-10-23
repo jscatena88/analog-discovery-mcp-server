@@ -25,6 +25,8 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **Frequency counters** on scope channels and DIO pins (software-counted on the AD2, which has no hardware counter)
 - **Parallel bus patterns** across several DIO pins, triggered pattern start, output driver types
 - **JTAG** bit-banged on any four DIO pins: IDCODE chain read, device count, IR/DR scans, TAP state walks
+- **SWD** via the hardware engine: debug port IDCODE, access port IDR and ROM table base (identifies Cortex-M parts read-only), raw DP/AP register access
+- **Board discovery** for reverse engineering: passive pin observation and classification, UART detection and decoding, and I2C / SWD / JTAG port searches over candidate pins
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -260,6 +262,7 @@ The protocol engines run on any DIO pins; pick pins that are not in use by the p
 **`i2c_scan(scl_pin=0, sda_pin=1, rate=100e3, first=0x08, last=0x77)`** lists the addresses that acknowledge. **`i2c_write(address, data, ...)`**, **`i2c_read(address, count, ...)`** and **`i2c_write_read(address, data, count, ...)`** (write then repeated-start read, the usual register read) report `acknowledged`, the NAK position and the bytes transferred. Addresses are 7-bit and not pre-shifted. **`i2c_spy(duration_s=2, max_messages=100, ...)`** passively decodes traffic between other devices into messages with address, direction, data and NAK/stop flags.
 
 The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wiring hint instead of returning garbage.
+Each I2C tool takes `method`: `auto` (default), `engine` or `bitbang`. The WaveForms I2C engine has been seen to report bus errors, or acknowledge every address, on buses that are electrically fine (an MPU6886 with proper pull-ups, for one). In `auto` the tools use the engine, retry with clock-stretch detection off on a bus error, and fall back to a bit-banged open-drain master (about 5 ms per byte) when the engine still reports a bus error or phantom ACKs; the result's `method` says which path ran. `i2c_spy` always uses the engine.
 
 ### JTAG (bit-banged)
 
@@ -276,6 +279,25 @@ Example: an ESP8266 (GPIO13=TCK, GPIO14=TMS, GPIO12=TDI, GPIO15=TDO, plus its re
 ```
 jtag_probe_instructions {"ir_length": 5, "tck_pin": 1, "tms_pin": 3, "tdi_pin": 2, "tdo_pin": 0, "reset_pin": 4}
 ```
+
+### SWD
+
+The WaveForms SWD engine runs at hardware speed on two DIO pins in the range 0-9 (it rejects DIO 10-15). The JTAG-to-SWD switch sequence (and, optionally, the ADIv5.2 dormant wake-up) is bit-banged first.
+
+- **`swd_idcode(swclk_pin, swdio_pin, rate=1e6, dormant_wakeup=false)`** reads the debug port IDCODE (DPIDR) and decodes designer, version and part number with a Cortex-M class hint. Read-only.
+- **`swd_identify(...)`** additionally powers up the debug domain, reads access port 0's IDR (class and bus type, e.g. AHB-AP) and ROM table base (0xE00FF000 means a Cortex-M core), then powers the debug domain down again. Nothing is halted or written in target memory.
+- **`swd_read_register` / `swd_write_register`** give raw DP/AP access for anything beyond identification.
+
+### Board discovery (reverse engineering an unknown PCB)
+
+The intended order, least risk first:
+
+1. **Measure voltages** on unknown header pins with `measure_voltage` before wiring them to DIO (3.3 V logic, 5 V tolerant).
+2. **`observe_pins(duration_s=1)`** drives nothing: it reads every pin's level and records activity, classifying each as `static_high`, `static_low`, `few_edges`, `clock`, `uart_candidate`, `data` or `activity`, with pulse widths, frequency and a baud hint. It lists the quiet pins that are safe to probe. Active pins are the board's outputs: decode them instead of driving them.
+3. **`measure_pullups(pins)`** pulls each quiet pin low for 50 µs and times the rise: `strong_pullup` (I2C-ready), `weak_pullup`, `leakage_only`, `idle_low` (not pulsed) or `driven_high_or_no_fall` (a board output, leave it alone).
+4. **`detect_uart(pins?)`** estimates the baud rate from the shortest pulse, decodes 8N1 frames from a record and ranks candidates by the printable text that comes out, pointing to `uart_receive` for live reading.
+5. **`find_i2c(candidate_pins)`**, **`find_swd(candidate_pins)`** and **`find_jtag(candidate_pins, reset_pin?)`** try pin pairs or permutations and report what answers. The JTAG search tries an IDCODE pass over (TCK, TMS, TDO) first, then a BYPASS pass over (TCK, TMS, TDI, TDO) for TAPs without IDCODE; `reset_pin` handles chips that only answer shortly after reset. `exclude_pins` keeps reset lines, boot straps and enables untouched.
+6. Identify what was found (`swd_identify`, `jtag_idcode`, `jtag_probe_instructions`, `i2c_write_read`) and hand off to a real debugger for anything deeper.
 
 ### Analysis (spectrum, network and impedance analyzers)
 
@@ -354,7 +376,7 @@ Run the smoke script to exercise every instrument through the MCP tools:
 ```bash
 uv run smoke_test.py
 ```
-Add `--jumpered` or `--analog-bench` when that wiring is in place, `--jtag TCK,TMS,TDI,TDO` to read the IDCODE chain of a connected JTAG target, and `--diagnose` to check analog wiring with a DC step (it reports swapped +/- inputs and open capacitor paths).
+Add `--jumpered` or `--analog-bench` when that wiring is in place, `--jtag TCK,TMS,TDI,TDO` (with `--jtag-reset PIN` for windowed targets) to read a JTAG target, `--swd SWCLK,SWDIO` to identify an SWD target, `--i2c SCL,SDA` to scan a bus, and `--diagnose` to check analog wiring with a DC step (it reports swapped +/- inputs and open capacitor paths).
 
 ## Technical Details
 
@@ -386,6 +408,8 @@ Two groups of hardware tests need bench wiring and are enabled separately:
 ```bash
 uv run pytest --hardware --jumpered       # DIO0->DIO8, DIO1->DIO9, DIO2->DIO10, T1->DIO15
 uv run pytest --hardware --analog-bench   # W1->1+, 1- to GND, 0.22 uF from W1/1+ to 2+, 1 kOhm from 2+ to GND, 2- to GND
+uv run pytest --hardware --esp8266        # ESP8266 on DIO0->TDO, DIO1->TCK, DIO2->TDI, DIO3->TMS, DIO4->nReset
+uv run pytest --hardware --imu            # MPU6886 on V+ (3.3 V), SCL on DIO15, SDA on DIO7
 ```
 The digital jumpers exercise UART, SPI, the I2C bus check, a JTAG loopback scan and the external trigger; the analog bench is a 723 Hz high-pass that exercises the network and impedance analyzers, the spectrum tool and sweeps.
 `uv run smoke_test.py` walks every instrument outside pytest and prints one line per check; it takes the same `--jumpered` and `--analog-bench` flags, plus `--diagnose` for the analog wiring check.

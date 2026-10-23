@@ -19,8 +19,8 @@ except (ImportError, OSError) as e:
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
-from ad2 import (analogio, analysis, analyzer, bytesutil, digital, export, i2c, jtag, logic, pattern, scope,
-                 spectrum, spi, triggers, uart, wavegen)
+from ad2 import (analogio, analysis, analyzer, bytesutil, digital, discover, export, i2c, jtag, logic, pattern,
+                 scope, spectrum, spi, swd, triggers, uart, wavegen)
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
@@ -50,8 +50,28 @@ Tools by instrument:
   pulse-length conditions), record_logic (long records, up to 4M samples), measure_pin_frequency.
 - Triggers: set_trigger_pin drives T1/T2 from an instrument event; send_pc_trigger fires anything
   armed with trigger_source "pc". Every instrument can start from any other.
-- JTAG (bit-banged on any four DIO pins, a few ms per bit): jtag_idcode, jtag_count_devices,
-  jtag_scan (IR/DR shifts), jtag_tap_state (walk the TAP state machine), jtag_release.
+- JTAG (bit-banged on any four DIO pins, ~1 ms per bit): jtag_idcode, jtag_count_devices,
+  jtag_scan (IR/DR shifts), jtag_tap_state (walk the TAP state machine), jtag_probe_instructions
+  (map an undocumented TAP), jtag_release.
+- SWD (hardware engine on any two DIO pins): swd_idcode, swd_identify (DPIDR, AP IDR, ROM table
+  base: identifies Cortex-M debug ports read-only), swd_read_register, swd_write_register.
+- Board discovery for reverse engineering an unknown PCB: observe_pins (passive: levels and
+  activity classification for every pin), detect_uart (baud and decoded text from edge timing),
+  find_swd and find_jtag (search candidate pins for a debug port).
+
+Reverse-engineering workflow, least risk first:
+1. Measure each unknown header pin with measure_voltage (scope input) before wiring it to DIO; DIO
+   is 3.3 V logic, 5 V tolerant, never more.
+2. Wire the pins to DIO and run observe_pins without driving anything. Active pins are board outputs:
+   leave them as inputs and identify them (detect_uart decodes serial output; capture_logic / i2c_spy
+   for buses). Note which pins are quiet.
+3. measure_pullups on the quiet pins tells which have real pull-ups (I2C candidates) and which are
+   driven by the board. Then search quiet pins only: find_i2c on pull-up pairs, find_swd (DIO 0-9
+   only, hardware engine, fast) then find_jtag (IDCODE pass, then BYPASS pass; pass reset_pin for chips
+   that answer only after reset). Add exclude_pins for anything you do not want driven (reset,
+   boot straps, power enables).
+4. Identify what was found: swd_identify or jtag_idcode / jtag_probe_instructions. Hand off to a real
+   debugger (OpenOCD, VisualGDB, J-Link) for flash access, halting or memory reads.
 - Protocols on any DIO pins: uart_send, uart_receive, spi_transfer, i2c_scan, i2c_write, i2c_read,
   i2c_write_read, i2c_spy.
 - Analyzers: network_analyzer (Bode: gain/phase of ch2 relative to ch1 while W1 sweeps) and
@@ -574,6 +594,160 @@ def jtag_release() -> dict[str, Any]:
         return jtag.release(session)
 
 
+# --------------------------------------------------------------------------- SWD
+
+@mcp.tool()
+def swd_idcode(swclk_pin: int = 0, swdio_pin: int = 1, rate: float = 1e6,
+               dormant_wakeup: bool = False) -> dict[str, Any]:
+    """Switch a target to SWD (line reset + JTAG-to-SWD sequence) and read the debug port IDCODE
+    (DPIDR): designer, version and part number with a hint of the Cortex-M class. Read-only.
+
+    Args:
+        swclk_pin, swdio_pin: DIO pins on the target's SWCLK and SWDIO.
+        rate: SWCLK frequency in Hz (1e6 is safe for most targets).
+        dormant_wakeup: Also send the ADIv5.2 dormant-state selection alert first (DPv2 targets).
+    """
+    with tool_errors():
+        return swd.idcode(session, swclk_pin, swdio_pin, rate, dormant_wakeup)
+
+
+@mcp.tool()
+def swd_identify(swclk_pin: int = 0, swdio_pin: int = 1, rate: float = 1e6, dormant_wakeup: bool = False,
+                 restore: bool = True) -> dict[str, Any]:
+    """Identify a target over SWD: DPIDR, then power up the debug domain, read access port 0's IDR
+    (AP class and bus type, e.g. AHB-AP for a Cortex-M) and its ROM table base, then power the
+    debug domain down again (restore). Nothing is halted or written in target memory.
+
+    Args:
+        swclk_pin, swdio_pin, rate, dormant_wakeup: As for swd_idcode.
+        restore: Clear the debug power-up requests afterwards (leave the chip as found).
+    """
+    with tool_errors():
+        return swd.identify(session, swclk_pin, swdio_pin, rate, dormant_wakeup, restore)
+
+
+@mcp.tool()
+def swd_read_register(port: str, address: int, swclk_pin: int = 0, swdio_pin: int = 1,
+                      rate: float = 1e6) -> dict[str, Any]:
+    """Raw SWD read of a DP or AP register (address 0x0, 0x4, 0x8 or 0xC within the selected bank).
+    Call swd_idcode first to put the target in SWD mode."""
+    with tool_errors():
+        if port not in ("dp", "ap"):
+            raise ToolError("port must be 'dp' or 'ap'")
+        return swd.register_read(session, swclk_pin, swdio_pin, port, address, rate)
+
+
+@mcp.tool()
+def swd_write_register(port: str, address: int, value: int, swclk_pin: int = 0, swdio_pin: int = 1,
+                       rate: float = 1e6) -> dict[str, Any]:
+    """Raw SWD write of a DP or AP register. Writes can change target state (e.g. SELECT, CTRL/STAT,
+    AP CSW/TAR); use for identification only unless you know the target."""
+    with tool_errors():
+        if port not in ("dp", "ap"):
+            raise ToolError("port must be 'dp' or 'ap'")
+        return swd.register_write(session, swclk_pin, swdio_pin, port, address, value, rate)
+
+
+# --------------------------------------------------------------------------- board discovery
+
+@mcp.tool()
+def observe_pins(pins: list[int] | None = None, duration_s: float = 1.0,
+                 sampling_frequency: float = 1e6) -> dict[str, Any]:
+    """Passively observe DIO pins (nothing is driven): current levels, then a record classifying each
+    pin as static_high, static_low, few_edges, clock, uart_candidate, data or activity, with pulse
+    widths, frequency and a baud hint. Lists the quiet pins that are safe to probe with find_swd /
+    find_jtag. First step when reverse engineering an unknown board.
+
+    Args:
+        pins: Pins to report (default all 16).
+        duration_s: Observation window (duration_s * sampling_frequency <= 4,000,000 samples).
+        sampling_frequency: 1e6 resolves baud rates up to ~250 kbaud; raise it for faster signals.
+    """
+    with tool_errors():
+        return discover.observe(session, pins, duration_s, sampling_frequency)
+
+
+@mcp.tool()
+def measure_pullups(pins: list[int], drive_time_s: float = 50e-6) -> dict[str, Any]:
+    """Pull each pin low once for drive_time_s, release it, and time the rise: strong_pullup (I2C-ready),
+    weak_pullup, leakage_only (needs an external pull-up for I2C), no_pullup (pulled down), or
+    driven_high_or_no_fall (something on the board drives it: leave it alone). Use on quiet pins only.
+
+    Args:
+        pins: Pins to test.
+        drive_time_s: Length of the low pulse (5e-6 to 1e-3).
+    """
+    with tool_errors():
+        return discover.measure_pullups(session, pins, drive_time_s)
+
+
+@mcp.tool()
+def detect_uart(pins: list[int] | None = None, duration_s: float = 1.0, sampling_frequency: float = 1e6,
+                baud_rate: float | None = None, data_bits: int = 8) -> dict[str, Any]:
+    """Find UART output on pins: estimate the baud rate from the shortest pulse, decode 8N1 frames
+    from a record, and rank candidates by how much printable text came out. Passive.
+
+    Args:
+        pins: Pins to try (default all).
+        duration_s, sampling_frequency: Record settings (use >= 10x the baud rate).
+        baud_rate: Force a baud rate instead of estimating it.
+        data_bits: Data bits per frame.
+    """
+    with tool_errors():
+        return discover.detect_uart(session, pins, duration_s, sampling_frequency, baud_rate, data_bits)
+
+
+@mcp.tool()
+def find_swd(candidate_pins: list[int], rate: float = 1e6, dormant_wakeup: bool = False,
+             exclude_pins: list[int] | None = None) -> dict[str, Any]:
+    """Search for an SWD port: try every ordered pair of candidate pins as SWCLK/SWDIO and report
+    the pairs that answer with a valid DPIDR. Drives the candidate pins briefly; use quiet pins from
+    observe_pins only.
+
+    Args:
+        candidate_pins: Pins to try (2 or more).
+        rate: SWCLK frequency.
+        dormant_wakeup: Send the dormant-state wake-up before each attempt.
+        exclude_pins: Pins never to drive.
+    """
+    with tool_errors():
+        return discover.find_swd(session, candidate_pins, rate, dormant_wakeup, exclude_pins)
+
+
+@mcp.tool()
+def find_i2c(candidate_pins: list[int], rate: float = 100e3,
+             exclude_pins: list[int] | None = None) -> dict[str, Any]:
+    """Search for an I2C bus: try every ordered pair of candidate pins as SCL/SDA and report the
+    pairs where a device acknowledges an address scan. Both lines must idle high (pull-ups), so
+    use pins observe_pins reports as static_high. Drives the pins briefly with open-drain signalling.
+
+    Args:
+        candidate_pins: Pins to try (2 or more).
+        rate: Bus clock in Hz.
+        exclude_pins: Pins never to drive.
+    """
+    with tool_errors():
+        return discover.find_i2c(session, candidate_pins, rate, exclude_pins)
+
+
+@mcp.tool()
+def find_jtag(candidate_pins: list[int], exclude_pins: list[int] | None = None, reset_pin: int | None = None,
+              reset_delay_s: float = 0.03, window_s: float = 0.35, max_time_s: float = 120) -> dict[str, Any]:
+    """Search for a JTAG port on candidate pins. Pass 1 tries (TCK, TMS, TDO) permutations and looks
+    for a valid IDCODE after TAP reset; pass 2 tries (TCK, TMS, TDI, TDO) permutations and looks for
+    a shifted pattern coming back through BYPASS (TAPs without IDCODE). Reports the pins and the
+    IDCODE decode. Drives candidate pins; use quiet pins only and exclude anything sensitive.
+
+    Args:
+        candidate_pins: Pins to try (3 or more).
+        exclude_pins: Pins never to drive.
+        reset_pin, reset_delay_s, window_s: For targets that answer only after reset (see jtag_idcode).
+        max_time_s: Give up after this long.
+    """
+    with tool_errors():
+        return discover.find_jtag(session, candidate_pins, exclude_pins, reset_pin, reset_delay_s, window_s, max_time_s)
+
+
 # --------------------------------------------------------------------------- analyzers
 
 @mcp.tool()
@@ -981,7 +1155,7 @@ def spi_transfer(
 
 @mcp.tool()
 def i2c_scan(scl_pin: int = 0, sda_pin: int = 1, rate: float = 100e3,
-             first: int = 0x08, last: int = 0x77) -> dict[str, Any]:
+             first: int = 0x08, last: int = 0x77, method: str = "auto") -> dict[str, Any]:
     """Probe every 7-bit address in [first, last] and list the ones that acknowledge. Fails with a
     wiring hint if SDA or SCL is held low (missing pull-ups or unpowered slave).
 
@@ -989,14 +1163,16 @@ def i2c_scan(scl_pin: int = 0, sda_pin: int = 1, rate: float = 100e3,
         scl_pin, sda_pin: DIO pins for clock and data.
         rate: Bus clock in Hz (100e3 standard, 400e3 fast).
         first, last: Address range to scan.
+        method: auto (engine, then bit-bang if the engine reports a bus error or phantom ACKs),
+            engine, or bitbang (slow, ~5 ms per byte, but works on buses the engine cannot handle).
     """
     with tool_errors():
-        return i2c.scan(session, scl_pin, sda_pin, rate, first, last)
+        return i2c.scan(session, scl_pin, sda_pin, rate, first, last, method)
 
 
 @mcp.tool()
 def i2c_write(address: int, data: str | list[int], scl_pin: int = 0, sda_pin: int = 1,
-              rate: float = 100e3) -> dict[str, Any]:
+              rate: float = 100e3, method: str = "auto") -> dict[str, Any]:
     """Write bytes to a 7-bit I2C address. The result says whether every byte was acknowledged.
 
     Args:
@@ -1005,24 +1181,24 @@ def i2c_write(address: int, data: str | list[int], scl_pin: int = 0, sda_pin: in
         scl_pin, sda_pin, rate: Bus settings.
     """
     with tool_errors():
-        return i2c.write(session, address, data, scl_pin, sda_pin, rate)
+        return i2c.write(session, address, data, scl_pin, sda_pin, rate, method)
 
 
 @mcp.tool()
 def i2c_read(address: int, count: int, scl_pin: int = 0, sda_pin: int = 1,
-             rate: float = 100e3) -> dict[str, Any]:
+             rate: float = 100e3, method: str = "auto") -> dict[str, Any]:
     """Read count bytes from a 7-bit I2C address."""
     with tool_errors():
-        return i2c.read(session, address, count, scl_pin, sda_pin, rate)
+        return i2c.read(session, address, count, scl_pin, sda_pin, rate, method)
 
 
 @mcp.tool()
 def i2c_write_read(address: int, data: str | list[int], count: int, scl_pin: int = 0,
-                   sda_pin: int = 1, rate: float = 100e3) -> dict[str, Any]:
+                   sda_pin: int = 1, rate: float = 100e3, method: str = "auto") -> dict[str, Any]:
     """Write bytes (typically a register number) then read count bytes after a repeated start,
     the usual way to read a register from a sensor."""
     with tool_errors():
-        return i2c.write_read(session, address, data, count, scl_pin, sda_pin, rate)
+        return i2c.write_read(session, address, data, count, scl_pin, sda_pin, rate, method)
 
 
 @mcp.tool()

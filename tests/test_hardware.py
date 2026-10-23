@@ -336,6 +336,74 @@ def test_trigger_pin_output_round_trip(hw):
     assert out["direction"] == "input"
 
 
+esp8266 = pytest.mark.esp8266
+
+
+@esp8266
+def test_find_jtag_locates_esp8266_tap(hw):
+    # ESP8266 wired DIO0->TDO, DIO1->TCK, DIO2->TDI, DIO3->TMS, DIO4->nReset; it answers only after reset
+    out = call_tool(hw, "find_jtag", candidate_pins=[0, 1, 2, 3, 5], reset_pin=4, max_time_s=240)
+    assert len(out["found"]) == 1
+    hit = out["found"][0]
+    assert hit["method"] == "bypass" and hit["dr_delay_bits"] == 1
+    assert (hit["tck"], hit["tms"], hit["tdi"], hit["tdo"]) == (1, 3, 2, 0)
+
+
+@esp8266
+def test_probe_esp8266_instructions(hw):
+    out = call_tool(hw, "jtag_probe_instructions", ir_length=5, tck_pin=1, tms_pin=3, tdi_pin=2, tdo_pin=0,
+                    reset_pin=4, instructions=[0x16, 0x17, 0x18, 0x1F])
+    lengths = {e["instruction"]: e["dr_length"] for e in out["instructions"]}
+    assert lengths == {"0x16": 24, "0x17": 32, "0x18": 8, "0x1f": 1}
+    assert all(e["ir_capture"] == "0x01" for e in out["instructions"])
+
+
+imu = pytest.mark.imu
+
+
+@imu
+def test_find_i2c_and_identify_mpu6886(hw):
+    call_tool(hw, "set_power_supplies", positive_volts=3.3, positive_enabled=True)
+    try:
+        pull = call_tool(hw, "measure_pullups", pins=[7, 15])
+        assert pull["pins"]["dio7"]["kind"] == "strong_pullup" and pull["pins"]["dio15"]["kind"] == "strong_pullup"
+        out = call_tool(hw, "find_i2c", candidate_pins=[7, 15])
+        assert out["found"] and (out["found"][0]["scl"], out["found"][0]["sda"]) == (15, 7)
+        assert "0x68" in out["found"][0]["addresses"]
+        who = call_tool(hw, "i2c_write_read", address=0x68, data="75", count=1, scl_pin=15, sda_pin=7)
+        assert who["acknowledged"] and who["read"]["hex"] == "19"
+        acc = call_tool(hw, "i2c_write_read", address=0x68, data="3b", count=6, scl_pin=15, sda_pin=7)
+        assert acc["read"]["length"] == 6
+    finally:
+        call_tool(hw, "disable_power_supplies")
+
+
+def test_observe_and_detect_uart_from_pattern(hw):
+    bits = [1] * 40
+    for b in b"bench uart\r\n":
+        bits += [0] + [(b >> k) & 1 for k in range(8)] + [1, 1]
+    call_tool(hw, "generate_pattern", channel=6, kind="custom", frequency=115200, data=bits + [1] * 40)
+    obs = call_tool(hw, "observe_pins", pins=[6, 9], duration_s=0.05, sampling_frequency=2e6)
+    det = call_tool(hw, "detect_uart", pins=[6], duration_s=0.05, sampling_frequency=2e6)
+    call_tool(hw, "stop_pattern")
+    assert obs["pins"]["dio6"]["kind"] == "uart_candidate" and obs["pins"]["dio6"]["baud_hint"] == 115200
+    assert det["candidates"][0]["baud"] == 115200 and det["candidates"][0]["confidence"] == "high"
+    assert "bench uart" in det["candidates"][0]["sample_text"]
+
+
+def test_find_swd_on_floating_pins_finds_nothing(hw):
+    out = call_tool(hw, "find_swd", candidate_pins=[5, 6, 8, 12])
+    assert out["found"] == [] and out["pairs_tried"] == 6 and out["skipped_pins"] == [12]
+
+
+def test_measure_pullups_on_floating_and_driven_pins(hw):
+    call_tool(hw, "write_digital_pins", high=[13], low=[12])     # emulate board outputs driving pins
+    out = call_tool(hw, "measure_pullups", pins=[12, 13])
+    call_tool(hw, "write_digital_pins", inputs=[12, 13])
+    assert out["pins"]["dio13"]["kind"] == "driven_high_or_no_fall"
+    assert out["pins"]["dio12"]["kind"] == "idle_low"
+
+
 def test_wavegen_trigger_source(hw):
     call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
     out = call_tool(hw, "capture_waveform", channels=[1], trigger_source="wavegen1", trigger_timeout_s=0,

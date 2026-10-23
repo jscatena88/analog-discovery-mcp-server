@@ -132,7 +132,7 @@ def test_spi_rejects_bad_arguments(server, fake_dwf):
 
 def test_i2c_scan_finds_fake_slave(server):
     out = call_tool(server, "i2c_scan", scl_pin=3, sda_pin=4)
-    assert out == {"scanned": "0x08-0x77", "found": ["0x1d"], "count": 1}
+    assert out == {"scanned": "0x08-0x77", "found": ["0x1d"], "count": 1, "method": "engine"}
 
 
 def test_i2c_write_read_and_write_read(server, fake_dwf):
@@ -157,10 +157,71 @@ def test_i2c_nak_is_reported_not_raised(server):
 def test_i2c_bus_not_free_gives_wiring_hint(server, fake_dwf):
     fake_dwf.i2c_bus_free = 0
     with pytest.raises(RuntimeError, match="pull-up"):
-        call_tool(server, "i2c_scan")
+        call_tool(server, "i2c_scan", method="engine")
     with pytest.raises(RuntimeError, match="DIO4/DIO3"):
-        call_tool(server, "i2c_write", address=0x1D, data=[1], scl_pin=3, sda_pin=4)
+        call_tool(server, "i2c_write", address=0x1D, data=[1], scl_pin=3, sda_pin=4, method="engine")
     assert not fake_dwf.calls_to("FDwfDigitalI2cWrite")
+    # auto mode bit-bangs instead; with the lines really low it reports the bus error with the same hint
+    out = call_tool(server, "i2c_write", address=0x1D, data=[1], scl_pin=3, sda_pin=4)
+    assert out["bus_error"] is True and "pull-up" in out["note"] and out["method"] == "bitbang"
+
+
+def test_i2c_retries_with_clock_stretch_detection_off(server, fake_dwf):
+    fake_dwf.i2c_stretch_faults = True
+    out = call_tool(server, "i2c_scan", scl_pin=3, sda_pin=4)
+    assert out["found"] == ["0x1d"] and "bus_error" not in out
+    assert "disabled" in out["clock_stretching"]
+    assert fake_dwf.i2c_stretch_detect == 0
+    out = call_tool(server, "i2c_write_read", address=0x1D, data=[2], count=2, scl_pin=3, sda_pin=4)
+    assert out["acknowledged"] is True and out["read"]["bytes"] == [2, 3]
+    # a fresh session configures stretch detection on again and the read path also falls back
+    call_tool(server, "disconnect_device")
+    fake_dwf.i2c_stretch_detect = 1
+    out = call_tool(server, "i2c_read", address=0x1D, count=1, scl_pin=3, sda_pin=4)
+    assert out["acknowledged"] is True and "clock_stretching" in out
+
+
+def test_i2c_scan_flags_stuck_sda(server, fake_dwf):
+    fake_dwf.i2c_devices = {a: bytearray(1) for a in range(0x80)}     # everything "acknowledges"
+    out = call_tool(server, "i2c_scan", scl_pin=3, sda_pin=4, method="engine")
+    assert out["found"] == [] and "SDA is stuck low" in out["note"]
+
+
+def test_i2c_pin_change_resets_engine(server, fake_dwf):
+    call_tool(server, "i2c_scan", scl_pin=3, sda_pin=4, first=0x1D, last=0x1D)
+    resets = len(fake_dwf.calls_to("FDwfDigitalI2cReset"))
+    call_tool(server, "i2c_scan", scl_pin=3, sda_pin=4, rate=400e3, first=0x1D, last=0x1D)   # rate only: no reset
+    assert len(fake_dwf.calls_to("FDwfDigitalI2cReset")) == resets
+    call_tool(server, "i2c_scan", scl_pin=4, sda_pin=3, first=0x1D, last=0x1D)              # pins swapped: reset
+    assert len(fake_dwf.calls_to("FDwfDigitalI2cReset")) == resets + 1
+
+
+def test_i2c_bitbang_talks_to_simulated_slave(server, fake_dwf):
+    from conftest import FakeI2cSlave
+    fake_dwf.i2c_slave = FakeI2cSlave(scl=15, sda=7, address=0x68, registers=bytearray([0x19 if i == 0x75 else i for i in range(0x80)]))
+    out = call_tool(server, "i2c_scan", scl_pin=15, sda_pin=7, method="bitbang")
+    assert out["found"] == ["0x68"] and out["method"] == "bitbang"
+    out = call_tool(server, "i2c_write_read", address=0x68, data="75", count=1, scl_pin=15, sda_pin=7, method="bitbang")
+    assert out["acknowledged"] and out["read"]["hex"] == "19"
+    out = call_tool(server, "i2c_write_read", address=0x68, data="3b", count=3, scl_pin=15, sda_pin=7, method="bitbang")
+    assert out["read"]["bytes"] == [0x3B, 0x3C, 0x3D]
+    out = call_tool(server, "i2c_write", address=0x69, data=[1], scl_pin=15, sda_pin=7, method="bitbang")
+    assert out["acknowledged"] is False and out["nak_index"] == 1
+    assert not (fake_dwf.dio_output_enable & ((1 << 15) | (1 << 7)))      # lines released afterwards
+
+
+def test_i2c_auto_falls_back_to_bitbang_on_engine_bus_error(server, fake_dwf):
+    from conftest import FakeI2cSlave
+    fake_dwf.i2c_slave = FakeI2cSlave(scl=15, sda=7, address=0x68)
+    fake_dwf.i2c_bus_free = 0                                            # engine says the bus is not free
+    out = call_tool(server, "i2c_scan", scl_pin=15, sda_pin=7)
+    assert out["found"] == ["0x68"] and out["method"] == "bitbang" and "bit-banged instead" in out["note_method"]
+    fake_dwf.i2c_bus_free = 1
+    fake_dwf.i2c_devices = {a: bytearray(1) for a in range(0x80)}        # engine phantom-ACKs everything
+    out = call_tool(server, "i2c_scan", scl_pin=15, sda_pin=7)
+    assert out["found"] == ["0x68"] and out["method"] == "bitbang"
+    out = call_tool(server, "i2c_scan", scl_pin=15, sda_pin=7, method="engine")
+    assert out["found"] == [] and "SDA is stuck low" in out["note"]
 
 
 def test_i2c_rejects_bad_arguments(server):

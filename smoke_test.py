@@ -61,6 +61,9 @@ def main():
     parser.add_argument("--configuration", type=int, default=0, help="firmware configuration to open")
     parser.add_argument("--jtag", metavar="TCK,TMS,TDI,TDO", help="DIO pins wired to a JTAG target: read its IDCODE chain")
     parser.add_argument("--jtag-reset", type=int, metavar="PIN", help="DIO pin on the JTAG target's reset line (pulsed before each read)")
+    parser.add_argument("--swd", metavar="SWCLK,SWDIO", help="DIO pins wired to an SWD target: identify it")
+    parser.add_argument("--i2c", metavar="SCL,SDA", help="DIO pins wired to an I2C bus (with pull-ups): scan it")
+    parser.add_argument("--vplus", type=float, metavar="VOLTS", help="power the target from V+ at this voltage during the target checks (e.g. 3.3)")
     args = parser.parse_args()
 
     if args.diagnose:
@@ -283,8 +286,53 @@ def main():
                           for d in ids["devices"])
         return f"{count} device(s) by BYPASS; {parts}"
 
+    if args.vplus:
+        @check("target power from V+")
+        def _():
+            s = call("set_power_supplies", positive_volts=args.vplus, positive_enabled=True)
+            time.sleep(0.3)
+            expect(s["positive"]["active"], "V+ did not switch on")
+            return f"V+ = {s['positive']['voltage_v']:.2f} V for the target checks"
+
+    @check("observe_pins (passive)")
+    def _():
+        out = call("observe_pins", duration_s=0.2)
+        kinds = {k: len(v) for k, v in out["by_kind"].items()}
+        return f"{len(out['quiet_pins'])} quiet pins; kinds {kinds}"
+
+    @check("detect_uart via pattern loopback")
+    def _():
+        bits = [1] * 40
+        for b in b"smoke uart\r\n":
+            bits += [0] + [(b >> k) & 1 for k in range(8)] + [1, 1]
+        call("generate_pattern", channel=6, kind="custom", frequency=115200, data=bits + [1] * 40)
+        out = call("detect_uart", pins=[6], duration_s=0.1, sampling_frequency=2e6)
+        call("stop_pattern")
+        expect(out["candidates"] and out["candidates"][0]["baud"] == 115200,
+               f"candidates {[(c['pin'], c['baud'], c['confidence']) for c in out['candidates']]}")
+        return f"DIO6 decoded at 115200: {out['candidates'][0]['sample_text'][:12]!r}"
+
+    swd_pins = [int(p) for p in args.swd.split(",")] if args.swd else None
+
+    @check("swd target identify", "swd SWCLK,SWDIO", swd_pins is not None)
+    def _():
+        out = call("swd_identify", swclk_pin=swd_pins[0], swdio_pin=swd_pins[1])
+        expect(out["responded"], out.get("note", "no response"))
+        ap = out.get("ap0", {})
+        return f"DPIDR {out['dpidr']} ({out.get('part_hint', out['designer'])}); AP0 {ap.get('type', '?')} ROM {ap.get('rom_table_base', '?')}"
+
+    i2c_pins = [int(p) for p in args.i2c.split(",")] if args.i2c else None
+
+    @check("i2c bus scan", "i2c SCL,SDA", i2c_pins is not None)
+    def _():
+        out = call("i2c_scan", scl_pin=i2c_pins[0], sda_pin=i2c_pins[1])
+        expect(out["count"] >= 1, "no device acknowledged")
+        return f"{out['count']} device(s): {', '.join(out['found'])}"
+
     @check("disconnect_device")
     def _():
+        if args.vplus:
+            call("disable_power_supplies")
         out = call("disconnect_device")
         expect(out["was_connected"], "was not connected")
         return "all outputs off, device released"

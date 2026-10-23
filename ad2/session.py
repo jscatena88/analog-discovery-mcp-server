@@ -92,6 +92,7 @@ class Session:
         self.spi_settings = None
         self.i2c_settings = None        # (scl, sda, rate) in effect
         self.jtag = None                # ad2.jtag.Port when a JTAG port is set up
+        self.swd_settings = None        # (swclk, swdio, rate) in effect
         self.wavegen_running = set()    # channels with an active output
         self.pattern_running = set()    # DIO pins driven by the pattern generator
 
@@ -140,6 +141,7 @@ class Session:
                          lambda: device.dwf.FDwfDigitalUartReset(dd.handle),
                          lambda: device.dwf.FDwfDigitalSpiReset(dd.handle),
                          lambda: device.dwf.FDwfDigitalI2cReset(dd.handle),
+                         lambda: device.dwf.FDwfDigitalSwdReset(dd.handle),
                          lambda: digital.reset(dd),
                          lambda: analogio.disable_supplies(dd, settle=False),
                          lambda: device.close(dd)):
@@ -155,6 +157,7 @@ class Session:
         self.spi_settings = None
         self.i2c_settings = None
         self.jtag = None
+        self.swd_settings = None
         self.wavegen_running = set()
         self.pattern_running = set()
 

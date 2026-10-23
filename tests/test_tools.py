@@ -20,7 +20,8 @@ def test_tool_list_is_complete(server):
         "record_waveform", "measure_frequency", "record_logic", "measure_pin_frequency",
         "generate_bus_pattern", "set_trigger_pin", "send_pc_trigger",
         "jtag_idcode", "jtag_count_devices", "jtag_scan", "jtag_tap_state", "jtag_release",
-        "jtag_probe_instructions",
+        "jtag_probe_instructions", "swd_idcode", "swd_identify", "swd_read_register", "swd_write_register",
+        "observe_pins", "detect_uart", "find_swd", "find_jtag", "find_i2c", "measure_pullups",
     }
 
 

@@ -24,25 +24,33 @@ def pytest_addoption(parser):
                      help="also run hardware tests that need jumpers DIO0->8, DIO1->9, DIO2->10, T1->DIO15")
     parser.addoption("--analog-bench", action="store_true", default=False,
                      help="also run hardware tests that need W1->1+ and the RC circuit on 2+ (see test_hardware.py)")
+    parser.addoption("--esp8266", action="store_true", default=False,
+                     help="also run hardware tests that need an ESP8266 on DIO0-4 (TDO, TCK, TDI, TMS, nReset)")
+    parser.addoption("--imu", action="store_true", default=False,
+                     help="also run hardware tests that need an MPU6886 on V+ with SCL on DIO15 and SDA on DIO7")
 
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "hardware: needs a connected Analog Discovery 2")
     config.addinivalue_line("markers", "jumpered: needs digital loopback jumpers on the device")
     config.addinivalue_line("markers", "analog_bench: needs the W1 / RC analog bench wiring")
+    config.addinivalue_line("markers", "esp8266: needs an ESP8266 JTAG target on DIO0-4")
+    config.addinivalue_line("markers", "imu: needs an MPU6886 on V+, SCL DIO15, SDA DIO7")
 
 
 def pytest_collection_modifyitems(config, items):
+    groups = (("jumpered", "--jumpered", "digital loopback jumpers"),
+              ("analog_bench", "--analog-bench", "the W1 / RC wiring"),
+              ("esp8266", "--esp8266", "an ESP8266 on DIO0-4"),
+              ("imu", "--imu", "an MPU6886 on DIO7/DIO15"))
     skip_hw = pytest.mark.skip(reason="needs --hardware and a connected Analog Discovery 2")
-    skip_jumper = pytest.mark.skip(reason="needs --jumpered and digital loopback jumpers (see test_hardware.py)")
-    skip_analog = pytest.mark.skip(reason="needs --analog-bench and the W1 / RC wiring (see test_hardware.py)")
     for item in items:
         if "hardware" in item.keywords and not config.getoption("--hardware"):
             item.add_marker(skip_hw)
-        elif "jumpered" in item.keywords and not config.getoption("--jumpered"):
-            item.add_marker(skip_jumper)
-        elif "analog_bench" in item.keywords and not config.getoption("--analog-bench"):
-            item.add_marker(skip_analog)
+            continue
+        for marker, option, what in groups:
+            if marker in item.keywords and not config.getoption(option):
+                item.add_marker(pytest.mark.skip(reason=f"needs {option} and {what} (see test_hardware.py)"))
 
 
 def _fill(buf, text):
@@ -104,6 +112,93 @@ class FakeTap:
         fake.dio_external = (fake.dio_external & ~(1 << self.tdo)) | (self.tdo_level << self.tdo)
 
 
+class FakeI2cSlave:
+    """A register-file I2C slave driven by the bit-banged master's output-enable changes. The master
+    pulls a line low by enabling its output (value 0); the slave pulls SDA low through sda_drive."""
+
+    def __init__(self, scl, sda, address=0x68, registers=None):
+        self.scl, self.sda, self.address = scl, sda, address
+        self.registers = registers if registers is not None else bytearray(range(0x80))
+        self.pointer = 0
+        self.active = False
+        self.n = 0                  # bits clocked in the current byte (8 = data done, 9 = ack clock done)
+        self.byte = 0
+        self.first = True           # next incoming byte is the address
+        self.out = False            # slave is transmitting
+        self.out_byte = 0
+        self.master_ack = False
+        self.sda_drive = 1
+
+    @staticmethod
+    def _master(enable, pin):
+        return 0 if (enable >> pin) & 1 else 1          # enabled output = master driving low
+
+    def observe(self, previous, current, fake):
+        scl_was, scl_is = self._master(previous, self.scl), self._master(current, self.scl)
+        sda_was, sda_is = self._master(previous, self.sda), self._master(current, self.sda)
+        if scl_was and scl_is and sda_was and not sda_is:          # START / repeated START
+            self.active, self.n, self.byte, self.first, self.out = True, 0, 0, True, False
+            self.sda_drive = 1
+        elif scl_was and scl_is and not sda_was and sda_is:        # STOP
+            self.active = False
+            self.sda_drive = 1
+        elif self.active and not scl_was and scl_is:               # SCL rising: sample
+            if self.n < 8:
+                if not self.out:
+                    self.byte = (self.byte << 1) | sda_is
+                self.n += 1
+            elif self.n == 8:
+                if self.out:
+                    self.master_ack = sda_is == 0
+                self.n = 9
+        elif self.active and scl_was and not scl_is:               # SCL falling: present
+            if self.n == 8:
+                if self.out:
+                    self.sda_drive = 1                              # release for the master's ACK
+                else:
+                    self._incoming_byte_done()
+            elif self.n == 9:
+                self.n, self.byte = 0, 0
+                if self.out:
+                    if getattr(self, "pending_first_bit", False):
+                        self.pending_first_bit = False            # first byte was loaded with the address
+                    elif not self.master_ack:
+                        self.active = False
+                        self.sda_drive = 1
+                        return self._publish(fake)
+                    else:
+                        self._load_next()
+                    self.sda_drive = (self.out_byte >> 7) & 1
+                else:
+                    self.sda_drive = 1
+            elif self.out:
+                self.sda_drive = (self.out_byte >> (7 - self.n)) & 1
+        self._publish(fake)
+
+    def _publish(self, fake):
+        fake.dio_external = (fake.dio_external & ~(1 << self.sda)) | (self.sda_drive << self.sda)
+
+    def _incoming_byte_done(self):
+        if self.first:
+            self.first = False
+            if (self.byte >> 1) != self.address:
+                self.active = False
+                self.sda_drive = 1
+                return
+            self.sda_drive = 0                                      # ACK the address
+            if self.byte & 1:
+                self.out = True
+                self._load_next()
+                self.pending_first_bit = True
+        else:
+            self.pointer = self.byte                                # register pointer write
+            self.sda_drive = 0
+
+    def _load_next(self):
+        self.out_byte = self.registers[self.pointer % len(self.registers)]
+        self.pointer += 1
+
+
 class FakeDwf:
     """Stand-in for libdwf. Every FDwf* call succeeds (returns 1) and is recorded; the handlers
     below fill output arguments with values resembling an Analog Discovery 2."""
@@ -130,6 +225,10 @@ class FakeDwf:
         self.uart_tx_log = []
         # I2C: one fake slave at 0x1D holding 16 bytes of "registers"
         self.i2c_bus_free = 1
+        self.i2c_target_pins = None          # (scl, sda): when set, the slave answers only on these pins
+        self.i2c_pins = (None, None)
+        self.i2c_stretch_detect = 1          # engine setting; some buses only work with it off
+        self.i2c_stretch_faults = False      # when True, transfers bus-error while stretch detection is on
         self.i2c_devices = {0x1D: bytearray(range(16))}
         self.i2c_writes = []
         self.i2c_spy_fragments = []     # (start, stop, bytes, nak) tuples handed out in order
@@ -144,6 +243,14 @@ class FakeDwf:
         self.counter_supported = True        # False models the AD2, which has no hardware counter
         # simulated JTAG target behind the static pins (None = no target; TDO follows dio_external)
         self.tap = None
+        # simulated bit-banged I2C slave on the static pins (None = none)
+        self.i2c_slave = None
+        # simulated SW-DP: answers on (swclk, swdio) == swd_target only
+        self.swd_target = None
+        self.swd_pins = (None, None)
+        self.swd_dp = {"ctrl_stat": 0, "select": 0}
+        self.swd_rdbuff = 0
+        self.swd_writes = []
         self.analog_counter_hz = 12345.0
         self.digital_counter_hz = 1e6
         self.counter_tick = 0
@@ -233,7 +340,12 @@ class FakeDwf:
     def _h_DigitalOutStatus(self, h, out): _set(out, 3)
 
     # static DIO
-    def _h_DigitalIOOutputEnableSet(self, h, mask): self.dio_output_enable = mask.value
+    def _h_DigitalIOOutputEnableSet(self, h, mask):
+        previous = self.dio_output_enable
+        self.dio_output_enable = mask.value
+        if self.i2c_slave is not None:
+            self.i2c_slave.observe(previous, self.dio_output_enable, self)
+
     def _h_DigitalIOOutputEnableGet(self, h, out): _set(out, self.dio_output_enable)
     def _h_DigitalIOOutputSet(self, h, mask):
         previous = self.dio_output
@@ -246,7 +358,17 @@ class FakeDwf:
 
     def _h_DigitalIOInputStatus(self, h, out):
         driven = self.dio_output & self.dio_output_enable
-        _set(out, driven | (self.dio_external & ~self.dio_output_enable))
+        value = driven | (self.dio_external & ~self.dio_output_enable)
+        if self.i2c_slave is not None:
+            # open-drain: an enabled (low) output or the slave pulling low wins; otherwise the pull-up
+            for pin in (self.i2c_slave.scl, self.i2c_slave.sda):
+                if (self.dio_output_enable >> pin) & 1:
+                    value &= ~(1 << pin)
+                elif pin == self.i2c_slave.sda:
+                    value = (value & ~(1 << pin)) | (self.i2c_slave.sda_drive << pin)
+                else:
+                    value |= 1 << pin
+        _set(out, value)
 
     # logic analyzer
     def _h_DigitalInStatus(self, h, read, status):
@@ -289,11 +411,25 @@ class FakeDwf:
             rx[i] = tx[i] if i < ntx.value else 0
 
     # I2C
+    def _h_DigitalI2cSclSet(self, h, pin): self.i2c_pins = (pin.value, self.i2c_pins[1])
+    def _h_DigitalI2cSdaSet(self, h, pin): self.i2c_pins = (self.i2c_pins[0], pin.value)
     def _h_DigitalI2cClear(self, h, free): _set(free, self.i2c_bus_free)
+    def _h_DigitalI2cStretchSet(self, h, flag): self.i2c_stretch_detect = flag.value
+
+    def _i2c_present(self, address):
+        if self.i2c_target_pins is not None and self.i2c_pins != self.i2c_target_pins:
+            return False
+        return address in self.i2c_devices
+
+    def _i2c_faulting(self):
+        return self.i2c_stretch_faults and self.i2c_stretch_detect
 
     def _h_DigitalI2cWrite(self, h, addr, tx, n, nak):
         address = addr.value >> 1
-        if address not in self.i2c_devices:
+        if self._i2c_faulting():
+            _set(nak, -1)
+            return
+        if not self._i2c_present(address):
             _set(nak, 1)
             return
         data = bytes(tx[:n.value]) if tx is not None and n.value else b""
@@ -302,6 +438,9 @@ class FakeDwf:
 
     def _h_DigitalI2cRead(self, h, addr, rx, n, nak):
         address = addr.value >> 1
+        if self._i2c_faulting():
+            _set(nak, -1)
+            return
         if address not in self.i2c_devices:
             _set(nak, 1)
             return
@@ -351,6 +490,40 @@ class FakeDwf:
         _set(out, table.get(measure.value, 0.0))
 
     def _h_AnalogImpedanceStatusWarning(self, h, ch, out): _set(out, 0)
+
+    # SWD engine with a simulated Cortex-M4 style SW-DP (DPIDR 0x2ba01477, AHB-AP 0x24770011)
+    def _h_DigitalSwdCkSet(self, h, pin): self.swd_pins = (pin.value, self.swd_pins[1])
+    def _h_DigitalSwdIoSet(self, h, pin): self.swd_pins = (self.swd_pins[0], pin.value)
+
+    def _swd_connected(self):
+        return self.swd_target is not None and self.swd_pins == self.swd_target
+
+    def _h_DigitalSwdRead(self, h, ap, a32, ack, value, crc):
+        if not self._swd_connected():
+            _set(ack, 7); _set(value, 0xFFFFFFFF); _set(crc, 1)
+            return
+        _set(crc, 0)
+        if ap.value:
+            bank = (self.swd_dp["select"] >> 4) & 0xF
+            table = {(0xF, 3): 0x24770011, (0xF, 2): 0xE00FF003}
+            self.swd_rdbuff = table.get((bank, a32.value), 0)
+            _set(ack, 1); _set(value, 0)
+            return
+        dp = {0: 0x2BA01477, 1: self.swd_dp["ctrl_stat"], 3: self.swd_rdbuff}
+        _set(ack, 1); _set(value, dp.get(a32.value, 0))
+
+    def _h_DigitalSwdWrite(self, h, ap, a32, ack, value):
+        if not self._swd_connected():
+            _set(ack, 7)
+            return
+        self.swd_writes.append(("ap" if ap.value else "dp", a32.value * 4, value.value))
+        if not ap.value:
+            if a32.value == 1:      # CTRL/STAT: ACK bits follow the requests
+                req = value.value & 0x50000000
+                self.swd_dp["ctrl_stat"] = req | (req << 1)
+            elif a32.value == 2:
+                self.swd_dp["select"] = value.value
+        _set(ack, 1)
 
     def _h_DigitalI2cSpyStatus(self, h, start, stop, data, count, nak):
         if self.i2c_spy_fragments:
