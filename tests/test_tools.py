@@ -19,6 +19,7 @@ def test_tool_list_is_complete(server):
         "capture_spectrum", "network_analyzer", "impedance_analyzer", "sweep_waveform",
         "record_waveform", "measure_frequency", "record_logic", "measure_pin_frequency",
         "generate_bus_pattern", "set_trigger_pin", "send_pc_trigger",
+        "jtag_idcode", "jtag_count_devices", "jtag_scan", "jtag_tap_state", "jtag_release",
     }
 
 

@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--analog-bench", action="store_true", help="W1 -> 1+ and the RC circuit on 2+ are wired")
     parser.add_argument("--diagnose", action="store_true", help="only run the analog wiring diagnosis")
     parser.add_argument("--configuration", type=int, default=0, help="firmware configuration to open")
+    parser.add_argument("--jtag", metavar="TCK,TMS,TDI,TDO", help="DIO pins wired to a JTAG target: read its IDCODE chain")
     args = parser.parse_args()
 
     if args.diagnose:
@@ -258,6 +259,27 @@ def main():
              save_csv=False)
         call("stop_pattern")
         return "scope triggered from T1 (driven by DIO15)"
+
+    @check("jtag loopback scan", "jumpered", args.jumpered)
+    def _():
+        pins = dict(tck_pin=0, tms_pin=1, tdi_pin=2, tdo_pin=10)
+        out = call("jtag_scan", register="dr", length=16, value="0xA5C3", **pins)
+        expect(out["shifted_out"] == "0xa5c3", f"read back {out['shifted_out']}")
+        call("jtag_release")
+        return "16-bit DR scan returned through the DIO2 -> DIO10 jumper"
+
+    jtag_pins = [int(p) for p in args.jtag.split(",")] if args.jtag else None
+
+    @check("jtag target IDCODE", "jtag TCK,TMS,TDI,TDO", jtag_pins is not None)
+    def _():
+        tck, tms, tdi, tdo = jtag_pins
+        pins = dict(tck_pin=tck, tms_pin=tms, tdi_pin=tdi, tdo_pin=tdo)
+        count = call("jtag_count_devices", **pins)["count"]
+        ids = call("jtag_idcode", **pins)
+        call("jtag_release")
+        expect(ids["count"] >= 1, ids.get("note", "no devices"))
+        parts = ", ".join(f"{d.get('idcode', 'bypass')} {d.get('manufacturer', '')}".strip() for d in ids["devices"])
+        return f"{count} device(s) by BYPASS, IDCODEs: {parts}"
 
     @check("disconnect_device")
     def _():

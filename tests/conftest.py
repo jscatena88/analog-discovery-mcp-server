@@ -63,6 +63,47 @@ AD2_IO = [
 ]
 
 
+class FakeTap:
+    """A minimal JTAG TAP: 4-bit IR (capture 0b0001), IDCODE on reset or IR 0b1110, BYPASS otherwise.
+    Clocked by TCK edges on the fake's static output word; TDO is presented on dio_external."""
+
+    def __init__(self, tck, tms, tdi, tdo, idcode=0x4BA00477):
+        self.tck, self.tms, self.tdi, self.tdo = tck, tms, tdi, tdo
+        self.idcode = idcode
+        self.state = "reset"
+        self.ir = 0b1110
+        self.shift = 0
+        self.shift_len = 32
+        self.tdo_level = 0
+
+    def observe(self, previous, current, fake):
+        from ad2.jtag import STATES
+        was_high = (previous >> self.tck) & 1
+        is_high = (current >> self.tck) & 1
+        tms = (current >> self.tms) & 1
+        tdi = (current >> self.tdi) & 1
+        if not was_high and is_high:                      # rising edge: capture/shift/update, then move
+            if self.state == "capture_dr":
+                if self.ir == 0b1110:
+                    self.shift, self.shift_len = self.idcode, 32
+                else:
+                    self.shift, self.shift_len = 0, 1
+            elif self.state == "capture_ir":
+                self.shift, self.shift_len = 0b0001, 4
+            elif self.state in ("shift_dr", "shift_ir"):
+                self.shift = (self.shift >> 1) | (tdi << (self.shift_len - 1))
+            nxt = STATES[self.state][tms]
+            if nxt == "update_ir":                        # entering update_ir latches the IR
+                self.ir = self.shift & 0xF
+            if nxt == "reset":
+                self.ir = 0b1110
+            self.state = nxt
+        elif was_high and not is_high:                    # falling edge: TDO shows the LSB of the shift register
+            if self.state in ("shift_dr", "shift_ir"):
+                self.tdo_level = self.shift & 1
+        fake.dio_external = (fake.dio_external & ~(1 << self.tdo)) | (self.tdo_level << self.tdo)
+
+
 class FakeDwf:
     """Stand-in for libdwf. Every FDwf* call succeeds (returns 1) and is recorded; the handlers
     below fill output arguments with values resembling an Analog Discovery 2."""
@@ -101,6 +142,8 @@ class FakeDwf:
         # record mode: samples handed out per status call; counters: fixed readings, tick advances per call
         self.record_chunk = 1000
         self.counter_supported = True        # False models the AD2, which has no hardware counter
+        # simulated JTAG target behind the static pins (None = no target; TDO follows dio_external)
+        self.tap = None
         self.analog_counter_hz = 12345.0
         self.digital_counter_hz = 1e6
         self.counter_tick = 0
@@ -192,7 +235,12 @@ class FakeDwf:
     # static DIO
     def _h_DigitalIOOutputEnableSet(self, h, mask): self.dio_output_enable = mask.value
     def _h_DigitalIOOutputEnableGet(self, h, out): _set(out, self.dio_output_enable)
-    def _h_DigitalIOOutputSet(self, h, mask): self.dio_output = mask.value
+    def _h_DigitalIOOutputSet(self, h, mask):
+        previous = self.dio_output
+        self.dio_output = mask.value
+        if self.tap is not None:
+            self.tap.observe(previous, self.dio_output, self)
+
     def _h_DigitalIOOutputGet(self, h, out): _set(out, self.dio_output)
     def _h_DigitalIOReset(self, h): self.dio_output_enable = 0; self.dio_output = 0
 

@@ -24,6 +24,7 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **Advanced triggering**: pulse-width, transition and window scope triggers with hold-off and hysteresis; multi-pin logic triggers with count and pulse-length conditions; every instrument can start from any other, from the PC, or from T1-T4; T1/T2 can be driven as trigger outputs
 - **Frequency counters** on scope channels and DIO pins (software-counted on the AD2, which has no hardware counter)
 - **Parallel bus patterns** across several DIO pins, triggered pattern start, output driver types
+- **JTAG** bit-banged on any four DIO pins: IDCODE chain read, device count, IR/DR scans, TAP state walks
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -260,6 +261,16 @@ The protocol engines run on any DIO pins; pick pins that are not in use by the p
 
 The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wiring hint instead of returning garbage.
 
+### JTAG (bit-banged)
+
+The WaveForms SDK has no JTAG engine, so these tools drive TCK/TMS/TDI as static outputs and sample TDO, at a few milliseconds per bit. That is enough for identification, boundary-scan experiments and small register accesses, not for programming. Pins default to TCK=DIO0, TMS=DIO1, TDI=DIO2, TDO=DIO3 and can be any four distinct pins; the target's TRST (if any) must be released externally.
+
+- **`jtag_idcode(tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices=8)`** resets the TAP and reads every device's 32-bit IDCODE with JEDEC manufacturer, part number and version; devices without an IDCODE register appear as BYPASS.
+- **`jtag_count_devices(...)`** counts the chain using BYPASS.
+- **`jtag_scan(register, length, value?, end_state="idle", ...)`** shifts a value through the IR or DR (LSB first) and returns what came out; chain an IR scan and a DR scan to use an instruction.
+- **`jtag_tap_state(state, ...)`** walks the TAP state machine along the shortest TMS path and reports the sequence.
+- **`jtag_release`** returns the pins to inputs.
+
 ### Analysis (spectrum, network and impedance analyzers)
 
 **`capture_spectrum(channel=1, sampling_frequency=1e6, buffer_size=0, range_volts=5, offset_volts=0, window="hann", max_peaks=10, preview_points=200, save_csv=true, csv_path?)`** takes one capture and returns the strongest peaks (frequency, volts peak, dBV), the fundamental's harmonics with THD, the noise floor, a max-hold preview and a CSV of every bin. Use `flattop` for the most accurate amplitudes. Resolution is `sampling_frequency / buffer_size`, and the spectrum reaches half the sample rate.
@@ -337,7 +348,7 @@ Run the smoke script to exercise every instrument through the MCP tools:
 ```bash
 uv run smoke_test.py
 ```
-Add `--jumpered` or `--analog-bench` when that wiring is in place, and `--diagnose` to check analog wiring with a DC step (it reports swapped +/- inputs and open capacitor paths).
+Add `--jumpered` or `--analog-bench` when that wiring is in place, `--jtag TCK,TMS,TDI,TDO` to read the IDCODE chain of a connected JTAG target, and `--diagnose` to check analog wiring with a DC step (it reports swapped +/- inputs and open capacitor paths).
 
 ## Technical Details
 
@@ -370,7 +381,7 @@ Two groups of hardware tests need bench wiring and are enabled separately:
 uv run pytest --hardware --jumpered       # DIO0->DIO8, DIO1->DIO9, DIO2->DIO10, T1->DIO15
 uv run pytest --hardware --analog-bench   # W1->1+, 1- to GND, 0.22 uF from W1/1+ to 2+, 1 kOhm from 2+ to GND, 2- to GND
 ```
-The digital jumpers exercise UART, SPI, the I2C bus check and the external trigger; the analog bench is a 723 Hz high-pass that exercises the network and impedance analyzers, the spectrum tool and sweeps.
+The digital jumpers exercise UART, SPI, the I2C bus check, a JTAG loopback scan and the external trigger; the analog bench is a 723 Hz high-pass that exercises the network and impedance analyzers, the spectrum tool and sweeps.
 `uv run smoke_test.py` walks every instrument outside pytest and prints one line per check; it takes the same `--jumpered` and `--analog-bench` flags, plus `--diagnose` for the analog wiring check.
 
 ## Resources

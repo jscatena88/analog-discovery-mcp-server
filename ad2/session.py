@@ -91,6 +91,7 @@ class Session:
         self.uart_tx_ready = False      # TX line initialized (driven idle-high)
         self.spi_settings = None
         self.i2c_settings = None        # (scl, sda, rate) in effect
+        self.jtag = None                # ad2.jtag.Port when a JTAG port is set up
         self.wavegen_running = set()    # channels with an active output
         self.pattern_running = set()    # DIO pins driven by the pattern generator
 
@@ -153,6 +154,7 @@ class Session:
         self.uart_tx_ready = False
         self.spi_settings = None
         self.i2c_settings = None
+        self.jtag = None
         self.wavegen_running = set()
         self.pattern_running = set()
 

@@ -142,6 +142,20 @@ def test_spi_loopback(hw):
 
 
 @jumpered
+def test_jtag_loopback_scan(hw):
+    # TDI (DIO2) jumpered to TDO (DIO10): a DR scan reads back exactly what was shifted in
+    pins = dict(tck_pin=0, tms_pin=1, tdi_pin=2, tdo_pin=10)
+    out = call_tool(hw, "jtag_scan", register="dr", length=16, value="0xA5C3", **pins)
+    assert out["shifted_out"] == "0xa5c3" and out["tap_state"] == "idle"
+    out = call_tool(hw, "jtag_tap_state", state="shift_ir", **pins)
+    assert out["state"] == "shift_ir"
+    # with ones looping straight back, the IDCODE read sees an immediate end of chain
+    out = call_tool(hw, "jtag_idcode", **pins)
+    assert out["count"] == 0
+    assert call_tool(hw, "jtag_release")["released"] is True
+
+
+@jumpered
 def test_i2c_without_pullups_reports_bus_not_free(hw):
     with pytest.raises(RuntimeError, match="pull-up"):
         call_tool(hw, "i2c_scan", scl_pin=3, sda_pin=4)

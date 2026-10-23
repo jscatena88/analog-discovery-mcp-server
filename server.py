@@ -19,7 +19,7 @@ except (ImportError, OSError) as e:
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
-from ad2 import (analogio, analysis, analyzer, bytesutil, digital, export, i2c, logic, pattern, scope,
+from ad2 import (analogio, analysis, analyzer, bytesutil, digital, export, i2c, jtag, logic, pattern, scope,
                  spectrum, spi, triggers, uart, wavegen)
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
@@ -50,6 +50,8 @@ Tools by instrument:
   pulse-length conditions), record_logic (long records, up to 4M samples), measure_pin_frequency.
 - Triggers: set_trigger_pin drives T1/T2 from an instrument event; send_pc_trigger fires anything
   armed with trigger_source "pc". Every instrument can start from any other.
+- JTAG (bit-banged on any four DIO pins, a few ms per bit): jtag_idcode, jtag_count_devices,
+  jtag_scan (IR/DR shifts), jtag_tap_state (walk the TAP state machine), jtag_release.
 - Protocols on any DIO pins: uart_send, uart_receive, spi_transfer, i2c_scan, i2c_write, i2c_read,
   i2c_write_read, i2c_spy.
 - Analyzers: network_analyzer (Bode: gain/phase of ch2 relative to ch1 while W1 sweeps) and
@@ -476,6 +478,68 @@ def stop_waveform(channel: int = 0) -> dict[str, Any]:
     """Stop generator output on one channel, or on all channels with channel=0."""
     with tool_errors():
         return wavegen.stop(session, channel)
+
+
+# --------------------------------------------------------------------------- JTAG
+
+@mcp.tool()
+def jtag_idcode(tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: int = 3,
+                max_devices: int = 8) -> dict[str, Any]:
+    """Reset the JTAG TAP and read the IDCODE of every device in the chain (bit-banged over four
+    DIO pins). Each device reports its 32-bit IDCODE, JEDEC manufacturer, part number and version;
+    devices without an IDCODE register are listed as BYPASS. TRST, if the target has one, must be
+    released externally. Pins are 3.3 V logic.
+
+    Args:
+        tck_pin, tms_pin, tdi_pin, tdo_pin: DIO pins wired to the target's TCK, TMS, TDI, TDO.
+        max_devices: Stop after this many devices.
+    """
+    with tool_errors():
+        return jtag.idcode(session, max_devices, tck_pin, tms_pin, tdi_pin, tdo_pin)
+
+
+@mcp.tool()
+def jtag_count_devices(tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: int = 3,
+                       max_devices: int = 32) -> dict[str, Any]:
+    """Count the devices in the JTAG chain using BYPASS (works even for devices without IDCODE)."""
+    with tool_errors():
+        return jtag.count_devices(session, tck_pin, tms_pin, tdi_pin, tdo_pin, max_devices)
+
+
+@mcp.tool()
+def jtag_scan(register: str, length: int, value: int | str | None = None, end_state: str = "idle",
+              tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2, tdo_pin: int = 3) -> dict[str, Any]:
+    """Shift a value through the instruction (ir) or data (dr) register and return what came out
+    on TDO. Goes to Shift-IR/DR from the current TAP state, shifts `length` bits LSB first, then
+    exits through Update to end_state. Use an IR scan to select an instruction, then a DR scan to
+    read or write its register.
+
+    Args:
+        register: "ir" or "dr".
+        length: Number of bits to shift (1-4096).
+        value: Bits to shift in, as an int or hex string; default 0.
+        end_state: idle (default), pause_dr, pause_ir, update_dr, update_ir or reset.
+        tck_pin, tms_pin, tdi_pin, tdo_pin: DIO pin assignment.
+    """
+    with tool_errors():
+        return jtag.scan(session, register, length, value, end_state, tck_pin, tms_pin, tdi_pin, tdo_pin)
+
+
+@mcp.tool()
+def jtag_tap_state(state: str = "idle", tck_pin: int = 0, tms_pin: int = 1, tdi_pin: int = 2,
+                   tdo_pin: int = 3) -> dict[str, Any]:
+    """Walk the TAP state machine to a named state along the shortest TMS path and report the
+    sequence used. States: reset, idle, select_dr, capture_dr, shift_dr, exit1_dr, pause_dr,
+    exit2_dr, update_dr, and the same for _ir. "reset" clocks five TMS-high cycles."""
+    with tool_errors():
+        return jtag.tap_state(session, state, tck_pin, tms_pin, tdi_pin, tdo_pin)
+
+
+@mcp.tool()
+def jtag_release() -> dict[str, Any]:
+    """Return the JTAG pins to inputs and forget the TAP state."""
+    with tool_errors():
+        return jtag.release(session)
 
 
 # --------------------------------------------------------------------------- analyzers
