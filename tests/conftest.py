@@ -68,6 +68,12 @@ class FakeDwf:
         self.acquisition_done = True
         # 1 V (ch1) / 0.5 V (ch2) sine at 1/200 of the sample rate: ~41 periods per 8192-sample buffer
         self.signal = lambda ch, i, fs: (1.0 if ch == 0 else 0.5) * math.sin(2 * math.pi * i / 200)
+        # static DIO state and external levels seen on pins that are inputs
+        self.dio_output_enable = 0
+        self.dio_output = 0
+        self.dio_external = 0
+        # logic analyzer sample i: DIO0 toggles every 50 samples (1 MHz at 100 MS/s), DIO1 held high
+        self.logic_pattern = lambda i: ((i // 50) & 1) | 0b10
 
     def calls_to(self, name):
         return [args for called, args in self.calls if called == name]
@@ -147,6 +153,31 @@ class FakeDwf:
     def _h_DigitalInBitsInfo(self, h, n): _set(n, 16)
     def _h_DigitalInBufferSizeInfo(self, h, n): _set(n, 4096)
     def _h_DigitalOutCount(self, h, n): _set(n, 16)
+    def _h_DigitalOutDataInfo(self, h, ch, n): _set(n, 1024)
+    def _h_DigitalOutInternalClockInfo(self, h, out): _set(out, 100e6)
+    def _h_DigitalInInternalClockInfo(self, h, out): _set(out, 100e6)
+    def _h_DigitalOutCounterInfo(self, h, ch, lo, hi): _set(hi, 32768)
+    def _h_DigitalOutStatus(self, h, out): _set(out, 3)
+
+    # static DIO
+    def _h_DigitalIOOutputEnableSet(self, h, mask): self.dio_output_enable = mask.value
+    def _h_DigitalIOOutputEnableGet(self, h, out): _set(out, self.dio_output_enable)
+    def _h_DigitalIOOutputSet(self, h, mask): self.dio_output = mask.value
+    def _h_DigitalIOOutputGet(self, h, out): _set(out, self.dio_output)
+    def _h_DigitalIOReset(self, h): self.dio_output_enable = 0; self.dio_output = 0
+
+    def _h_DigitalIOInputStatus(self, h, out):
+        driven = self.dio_output & self.dio_output_enable
+        _set(out, driven | (self.dio_external & ~self.dio_output_enable))
+
+    # logic analyzer
+    def _h_DigitalInStatus(self, h, read, status):
+        if hasattr(status, "_obj"):
+            _set(status, 2 if self.acquisition_done else 1)
+
+    def _h_DigitalInStatusData(self, h, buf, nbytes):
+        for i in range(nbytes.value // 2):
+            buf[i] = self.logic_pattern(i)
 
     # scope acquisition
     def _h_AnalogInFrequencySet(self, h, f): self.sample_rate = f.value

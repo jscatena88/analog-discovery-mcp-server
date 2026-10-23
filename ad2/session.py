@@ -86,7 +86,9 @@ class Session:
         self.configuration = 0
         self.device_name = None
         self.scope_settings = None      # (sampling_frequency, buffer_size, range, offset) in effect
+        self.logic_settings = None      # (divider, buffer_size) in effect
         self.wavegen_running = set()    # channels with an active output
+        self.pattern_running = set()    # DIO pins driven by the pattern generator
 
     @property
     def connected(self) -> bool:
@@ -125,9 +127,12 @@ class Session:
         if not self.connected:
             return
         dd = self.device_data
-        from . import analogio  # local import: analogio does not depend on session
+        from . import analogio, digital  # local imports: neither depends on session
         for shutdown in (lambda: wf_scope.close(dd),
                          lambda: wf_wavegen.close(dd, 0),
+                         lambda: device.dwf.FDwfDigitalOutReset(dd.handle),
+                         lambda: device.dwf.FDwfDigitalInReset(dd.handle),
+                         lambda: digital.reset(dd),
                          lambda: analogio.disable_supplies(dd, settle=False),
                          lambda: device.close(dd)):
             try:
@@ -136,7 +141,9 @@ class Session:
                 pass
         self.device_data = None
         self.scope_settings = None
+        self.logic_settings = None
         self.wavegen_running = set()
+        self.pattern_running = set()
 
     def info(self) -> dict:
         dd = self.ensure()
@@ -168,4 +175,5 @@ class Session:
             "analog_io_channels": list(dd.analog.IO.channel_label),
             "scope_configured": self.scope_settings is not None,
             "wavegen_running_channels": sorted(self.wavegen_running),
+            "pattern_running_pins": sorted(self.pattern_running),
         }

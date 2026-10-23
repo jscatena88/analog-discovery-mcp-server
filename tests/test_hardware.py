@@ -67,6 +67,41 @@ def test_generate_and_stop(hw):
     assert call_tool(hw, "stop_waveform")["running_channels"] == []
 
 
+def test_static_pins_read_back_driven_levels(hw):
+    out = call_tool(hw, "write_digital_pins", high=[1], low=[2])
+    assert out["levels"]["dio1"] == 1 and out["levels"]["dio2"] == 0
+    assert out["output_pins"] == [1, 2]
+    out = call_tool(hw, "write_digital_pins", low=[1])
+    assert out["levels"]["dio1"] == 0
+    out = call_tool(hw, "write_digital_pins", inputs=[1, 2])
+    assert out["output_pins"] == []
+
+
+def test_pattern_clock_seen_by_logic_analyzer(hw):
+    gen = call_tool(hw, "generate_pattern", channel=0, kind="clock", frequency=1e6)
+    assert gen["frequency_hz"] == 1e6
+    out = call_tool(hw, "capture_logic", pins=[0], trigger_pin=0, pretrigger_samples=100, max_edges=3)
+    dio0 = out["pins"]["dio0"]
+    assert abs(dio0["frequency_hz_estimate"] - 1e6) < 1e4
+    assert dio0["transitions"] > 70
+    assert out["trigger"]["index"] == 100
+    fs = out["sampling_frequency_hz"]
+    # a rising edge sits at (or within a couple of samples of) the trigger time
+    assert any(level == 1 and abs(t - out["trigger"]["time_s"]) <= 3 / fs for t, level in dio0["edges"])
+    assert os.path.exists(out["csv_path"])
+    assert call_tool(hw, "stop_pattern")["running_channels"] == []
+    quiet = call_tool(hw, "capture_logic", pins=[0], save_csv=False)
+    assert quiet["pins"]["dio0"]["transitions"] <= 2
+
+
+def test_custom_pattern_bit_rate(hw):
+    # 11110000 at 1 Mbit/s is a 125 kHz square wave
+    call_tool(hw, "generate_pattern", channel=3, kind="custom", frequency=1e6, data="11110000")
+    out = call_tool(hw, "capture_logic", pins=[3], sampling_frequency=10e6, trigger_pin=3, save_csv=False)
+    assert abs(out["pins"]["dio3"]["frequency_hz_estimate"] - 125e3) < 2e3
+    call_tool(hw, "stop_pattern", channel=3)
+
+
 def test_power_supplies_round_trip(hw):
     out = call_tool(hw, "set_power_supplies", positive_volts=3.3, positive_enabled=True,
                     negative_volts=-2.0, negative_enabled=True)

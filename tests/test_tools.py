@@ -13,7 +13,8 @@ def test_tool_list_is_complete(server):
     assert names == {
         "list_devices", "connect_device", "disconnect_device", "get_device_info", "get_system_status",
         "set_power_supplies", "disable_power_supplies", "capture_waveform", "measure_voltage",
-        "generate_waveform", "stop_waveform",
+        "generate_waveform", "stop_waveform", "read_digital_pins", "write_digital_pins",
+        "generate_pattern", "stop_pattern", "capture_logic",
     }
 
 

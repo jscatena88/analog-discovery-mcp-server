@@ -19,7 +19,7 @@ except (ImportError, OSError) as e:
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
-from ad2 import analogio, analysis, export, scope, wavegen
+from ad2 import analogio, analysis, digital, export, logic, pattern, scope, wavegen
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
@@ -34,14 +34,19 @@ Instruments exposed:
 - Power supplies: V+ (0.5 to 5 V) and V- (-0.5 to -5 V). Tools: set_power_supplies,
   disable_power_supplies. Readings in get_system_status.
 - USB voltage/current and board temperature: get_system_status.
-Digital pins DIO 0-15 are not exposed yet.
+- Digital pins DIO 0-15 (3.3 V logic, 5 V tolerant), shared by three instruments:
+  static I/O (read_digital_pins, write_digital_pins), pattern generator (generate_pattern,
+  stop_pattern: clocks up to 50 MHz, pulses, custom bit streams) and logic analyzer
+  (capture_logic: 16 pins, up to 100 MS/s, 4096 samples by default, 16384 with configuration 3).
+  A pin driven by the pattern generator overrides its static level. The logic analyzer reads
+  back pins the device itself is driving, so loopback tests need no wiring.
 
 Workflow: tools auto-connect to the first device on first use; call connect_device only to pick a
-specific device or firmware configuration. capture_waveform returns summary statistics and a
-decimated preview and saves the full record to a CSV whose path is in the result; read that file
-for full-resolution data. Generator outputs and power supplies stay on until stopped or
-disconnect_device is called, which turns everything off. The WaveForms desktop application must
-not have the device open at the same time.
+specific device or firmware configuration. capture_waveform and capture_logic return summary
+statistics and a compact preview and save the full record to a CSV whose path is in the result;
+read that file for full-resolution data. Generator, pattern and power-supply outputs stay on
+until stopped or disconnect_device is called, which turns everything off. The WaveForms desktop
+application must not have the device open at the same time.
 """
 
 mcp = MCPServer("Analog Discovery 2", instructions=INSTRUCTIONS)
@@ -257,6 +262,128 @@ def stop_waveform(channel: int = 0) -> dict[str, Any]:
     """Stop generator output on one channel, or on all channels with channel=0."""
     with tool_errors():
         return wavegen.stop(session, channel)
+
+
+# --------------------------------------------------------------------------- static digital I/O
+
+@mcp.tool()
+def read_digital_pins() -> dict[str, Any]:
+    """Read the level of every DIO pin (0-15). Pins the device drives read back their own level.
+    Also reports which pins are currently configured as outputs."""
+    with tool_errors():
+        return digital.read(session.ensure())
+
+
+@mcp.tool()
+def write_digital_pins(
+    high: list[int] | None = None,
+    low: list[int] | None = None,
+    inputs: list[int] | None = None,
+) -> dict[str, Any]:
+    """Drive DIO pins as static outputs or release them. Pins not mentioned keep their state.
+
+    Args:
+        high: Pins to drive to logic 1 (3.3 V).
+        low: Pins to drive to logic 0.
+        inputs: Pins to release to high impedance (input).
+    """
+    with tool_errors():
+        return digital.write(session.ensure(), high, low, inputs)
+
+
+# --------------------------------------------------------------------------- pattern generator
+
+@mcp.tool()
+def generate_pattern(
+    channel: int,
+    kind: str = "clock",
+    frequency: float = 1e3,
+    duty_cycle: float = 50.0,
+    data: str | list[int] | None = None,
+    idle: str = "initial",
+    run_time_s: float = 0.0,
+    wait_s: float = 0.0,
+    repeat: int = 0,
+) -> dict[str, Any]:
+    """Start a digital pattern on a DIO pin. Runs until stop_pattern or disconnect_device.
+
+    Args:
+        channel: DIO pin number, 0-15.
+        kind: clock (50 % square wave), pulse (square wave with duty_cycle), custom (bit stream
+            from data, repeated), random (noise at the given bit rate).
+        frequency: Output frequency in Hz for clock/pulse (max 50e6); bit rate for custom/random.
+        duty_cycle: Percent high time for kind=pulse.
+        data: Bits for kind=custom, first bit sent first: "10110010", "0b1011", or [1,0,1,1].
+            Up to 1024 bits in the default configuration.
+        idle: Level between bursts and after stopping: initial, low, high, high_impedance.
+        run_time_s: Burst length in seconds; 0 = continuous. Shared by all pattern channels.
+        wait_s: Delay before each burst. Shared by all pattern channels.
+        repeat: Number of bursts; 0 = forever. Shared by all pattern channels.
+    """
+    with tool_errors():
+        return pattern.generate(session, channel, kind, frequency, duty_cycle, data, idle,
+                                run_time_s, wait_s, repeat)
+
+
+@mcp.tool()
+def stop_pattern(channel: int | None = None) -> dict[str, Any]:
+    """Stop the pattern generator on one DIO pin, or on every pin when channel is omitted."""
+    with tool_errors():
+        return pattern.stop(session, channel)
+
+
+# --------------------------------------------------------------------------- logic analyzer
+
+@mcp.tool()
+def capture_logic(
+    pins: list[int] | None = None,
+    sampling_frequency: float = 100e6,
+    buffer_size: int = 0,
+    trigger_pin: int | None = None,
+    trigger_edge: str = "rising",
+    pretrigger_samples: int = 0,
+    trigger_timeout_s: float = 1.0,
+    max_wait_s: float = 5.0,
+    max_edges: int = 100,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+) -> dict[str, Any]:
+    """Single-shot logic analyzer capture of DIO 0-15. Returns, per pin, the initial and final
+    level, transition count, high fraction, estimated frequency and the first transitions as
+    [time_s, new_level] pairs, plus the path of a CSV with every sample.
+
+    Args:
+        pins: Pins to report on (default: all 16). All pins are always captured and saved.
+        sampling_frequency: Sample rate in Hz, up to 100e6. Duration = buffer_size / rate.
+        buffer_size: Samples; 0 = configuration maximum (4096 by default, 16384 with configuration 3).
+        trigger_pin: Pin whose edge starts the capture; omit to capture immediately.
+        trigger_edge: rising, falling or either.
+        pretrigger_samples: Samples to keep from before the trigger edge.
+        trigger_timeout_s: Auto-trigger after this long without an edge; 0 = never.
+        max_wait_s: Hard limit on how long the tool waits.
+        max_edges: Maximum transitions listed inline per pin.
+        save_csv: Write the full capture to disk.
+        csv_path: Where to write it; default is a timestamped file under ./captures.
+    """
+    with tool_errors():
+        dd = session.ensure()
+        pins = digital.check_pins(dd, pins, "pins") or list(range(digital.pin_count(dd)))
+        fs, samples, trigger_index = logic.capture(session, sampling_frequency, buffer_size, trigger_pin,
+                                                   trigger_edge, pretrigger_samples, trigger_timeout_s,
+                                                   max_wait_s)
+        summaries = {f"dio{p}": logic.summarize_pin(samples, p, fs, max_edges) for p in pins}
+        path = logic.write_logic_csv(csv_path, fs, samples, digital.pin_count(dd)) if save_csv else None
+        return {
+            "sampling_frequency_hz": fs,
+            "samples": len(samples),
+            "duration_s": len(samples) / fs,
+            "trigger": None if trigger_pin is None else
+                {"pin": trigger_pin, "edge": trigger_edge, "index": trigger_index,
+                 "time_s": trigger_index / fs},
+            "active_pins": [p for p in pins if summaries[f"dio{p}"]["transitions"]],
+            "pins": summaries,
+            "csv_path": path,
+        }
 
 
 if __name__ == "__main__":

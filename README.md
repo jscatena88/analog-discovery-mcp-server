@@ -9,6 +9,9 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **Waveform generator**: sine, square, triangle, ramp, DC, noise, pulse, trapezium and sine-power outputs with symmetry/duty and burst (run, wait, repeat) control on W1 and W2
 - **Power supplies**: program and switch V+ / V- with range validation and setpoint/measured readback
 - **System monitor**: board temperature, USB voltage and current, auxiliary input
+- **Static digital I/O**: read all 16 DIO pins, drive pins high/low, release them to input
+- **Pattern generator**: clocks up to 50 MHz, pulses with duty cycle, custom bit streams and random data on any DIO pin, with burst control
+- **Logic analyzer**: 16-channel capture up to 100 MS/s with edge trigger and pre-trigger, per-pin transition/frequency summaries, and the full record saved as CSV
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -172,6 +175,41 @@ Output runs until **`stop_waveform(channel=0)`** (0 = all channels) or `disconne
 
 **`disable_power_supplies`** turns both rails and the master switch off.
 
+### Digital I/O (DIO 0-15)
+
+The 16 DIO pins are 3.3 V logic (5 V tolerant) and are shared by three instruments. A pin driven by the pattern generator overrides its static level, and the logic analyzer reads back pins the device itself is driving, so loopback experiments need no wiring.
+
+**`read_digital_pins`** returns every pin's level, the list of high pins and the list of pins configured as outputs.
+
+**`write_digital_pins(high?, low?, inputs?)`** drives the listed pins to 1 or 0, or releases them to high impedance. Pins not mentioned keep their state.
+
+**`generate_pattern(channel, kind="clock", frequency=1e3, duty_cycle=50, data?, idle="initial", run_time_s=0, wait_s=0, repeat=0)`**
+
+- `kind`: `clock` (50 % square), `pulse` (square with `duty_cycle`), `custom` (bit stream from `data`, repeated), `random`
+- `frequency`: output frequency for clock/pulse (max 50 MHz); bit rate for custom/random
+- `data`: `"10110010"`, `"0b1011"` or `[1, 0, 1, 1]`, first bit sent first, up to 1024 bits
+- `idle`: `initial`, `low`, `high`, `high_impedance`
+- `run_time_s`, `wait_s`, `repeat`: burst control, shared by all pattern channels
+
+The result reports the frequency actually produced. **`stop_pattern(channel?)`** stops one pin or all of them.
+
+**`capture_logic`** performs one logic analyzer acquisition.
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `pins` | all | Pins to summarize; every pin is always captured and saved |
+| `sampling_frequency` | `100e6` | Hz, up to 100e6 |
+| `buffer_size` | `0` | Samples; 0 = maximum (4096 by default, 16384 with configuration 3) |
+| `trigger_pin` | none | Pin whose edge starts the capture |
+| `trigger_edge` | `"rising"` | `rising`, `falling` or `either` |
+| `pretrigger_samples` | `0` | Samples kept from before the edge |
+| `trigger_timeout_s` | `1.0` | Auto-trigger after this long; 0 = never |
+| `max_wait_s` | `5.0` | Hard limit on how long the tool waits |
+| `max_edges` | `100` | Transitions listed inline per pin |
+| `save_csv`, `csv_path` | `true`, auto | As for `capture_waveform` |
+
+Per pin the result gives `initial_level`, `final_level`, `transitions`, `high_fraction`, `frequency_hz_estimate` and `edges` as `[time_s, new_level]` pairs; `active_pins` lists the pins that toggled. The CSV has a column per pin plus the raw 16-bit value.
+
 ## Usage Examples
 
 ### Basic Workflow
@@ -183,7 +221,9 @@ Output runs until **`stop_waveform(channel=0)`** (0 = all channels) or `disconne
 4. **Read the full record** from the `csv_path` in the result if the statistics and preview are not enough.
 5. **Power a circuit at 3.3 V**: `set_power_supplies {"positive_volts": 3.3, "positive_enabled": true}`
 6. **Check the DC level on channel 2**: `measure_voltage {"channel": 2}`
-7. **Shut everything down**: `disconnect_device`
+7. **Put a 1 MHz clock on DIO 0 and look at it**: `generate_pattern {"channel": 0, "kind": "clock", "frequency": 1000000}` then `capture_logic {"pins": [0], "trigger_pin": 0, "pretrigger_samples": 100}`
+8. **Toggle a reset line**: `write_digital_pins {"low": [5]}` ... `write_digital_pins {"high": [5]}`
+9. **Shut everything down**: `disconnect_device`
 
 To use the 16k-sample scope buffer, call `connect_device {"configuration": 1}` first.
 
@@ -237,7 +277,7 @@ This will test device connection, oscilloscope capture, and waveform generation.
 - **Packaging**: `pyproject.toml` + `uv.lock`, virtual environment managed by `uv`
 - **Python Library**: Uses `WF_SDK` wrapper from [Digilent's official WaveForms SDK Getting Started examples](https://github.com/Digilent/WaveForms-SDK-Getting-Started-PY)
 - **Device**: Digilent Analog Discovery 2
-- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor
+- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor, static digital I/O, pattern generator, logic analyzer
 - **Layout**: `server.py` registers the tools; `ad2/` holds one module per instrument on top of `WF_SDK/`
 - **Local WF_SDK patches**: macOS framework path fallback, and skipping digital buffer queries in firmware configurations that have no digital channels (otherwise `connect_device` with configuration 1 or 2 fails)
 - **Note**: Channels are 1-indexed (1-2) as per WF_SDK convention
