@@ -20,6 +20,10 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **Network analyzer**: Bode gain/phase sweeps with -3 dB cutoff and response classification
 - **Impedance analyzer**: |Z|, phase, R, X, C and L of a component against a reference resistor
 - **Generator extras**: custom sample data, phase offset, phase-aligned start of both channels, linear frequency sweeps
+- **Long records**: scope and logic analyzer streaming up to 2M / 4M samples
+- **Advanced triggering**: pulse-width, transition and window scope triggers with hold-off and hysteresis; multi-pin logic triggers with count and pulse-length conditions; every instrument can start from any other, from the PC, or from T1-T4; T1/T2 can be driven as trigger outputs
+- **Frequency counters** on scope channels and DIO pins (software-counted on the AD2, which has no hardware counter)
+- **Parallel bus patterns** across several DIO pins, triggered pattern start, output driver types
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -137,9 +141,13 @@ Every tool returns a JSON object. Failures (bad arguments, device busy, trigger 
 | `buffer_size` | `0` | Samples per channel; 0 = device maximum |
 | `range_volts` | `5.0` | Full-scale input range (±range); 5 V or 50 V on the AD2 |
 | `offset_volts` | `0.0` | Input offset |
-| `trigger_source` | `"none"` | `none`, `ch1`, `ch2`, `wavegen1`, `wavegen2`, `external1`..`external4` |
-| `trigger_level` | `0.0` | Volts (analog sources) |
-| `trigger_edge` | `"rising"` | `rising` or `falling` |
+| `trigger_source` | `"none"` | `none`, `ch1`, `ch2`, `wavegen1`, `wavegen2`, `pattern`, `logic`, `pc`, `external1`..`external4` |
+| `trigger_level` | `0.0` | Volts (ch1/ch2 sources) |
+| `trigger_edge` | `"rising"` | `rising`, `falling` or `either` (for `pulse`: rising = positive pulse) |
+| `trigger_type` | `"edge"` | `edge`, `pulse`, `transition` or `window` |
+| `trigger_length_s`, `trigger_length_condition` | `0`, `"more"` | Duration test for pulse/transition: `more`, `less`, `timeout` |
+| `trigger_holdoff_s`, `trigger_hysteresis_v` | `0`, device default | Hold-off between triggers; hysteresis / window half-width |
+| `filter`, `attenuation` | `"decimate"`, `1` | ADC sample reduction (`decimate`, `average`, `min_max`); probe factor |
 | `trigger_timeout_s` | `1.0` | Auto-trigger after this long without an event; 0 = never |
 | `max_wait_s` | `5.0` | Hard limit on how long the tool waits for the acquisition |
 | `preview_points` | `200` | Decimated samples returned inline per channel |
@@ -165,6 +173,10 @@ Signals under 20 mV peak-to-peak are treated as flat and get no frequency estima
 
 **`measure_voltage(channel, samples=16)`** returns an averaged instantaneous reading for a scope channel.
 
+**`record_waveform(channels?, sampling_frequency=100e3, duration_s=1, ...)`** streams a record longer than the buffer (up to 2,000,000 samples per channel, best below about 1 MS/s) and reports any samples lost. Same statistics, preview, CSV and edge-trigger options as `capture_waveform`.
+
+**`measure_frequency(channel=1, gate_time_s=0.1, trigger_level=0, ...)`** counts level crossings. Devices with a hardware counter use it; the AD2 has none, so the tool counts crossings in a 100 MS/s capture (fast signals) or in a record over `gate_time_s` (slow signals) and reports which `method` it used.
+
 ### Waveform generator
 
 **`generate_waveform(channel, function, frequency, amplitude, offset=0, symmetry=50, run_time_s=0, wait_s=0, repeat=0)`**
@@ -174,6 +186,8 @@ Signals under 20 mV peak-to-peak are treated as flat and get no frequency estima
 - `amplitude` + |`offset`| must stay within ±5 V; the tool refuses otherwise.
 - `symmetry`: duty cycle / skew in percent.
 - `run_time_s`, `wait_s`, `repeat`: burst control; zeros mean continuous.
+
+`trigger_source` (`pc`, `scope`, `logic`, `pattern`, the other `wavegen`, `external1`..`4`) arms the output to start on that event instead of immediately; `repeat_trigger` waits before every repeat.
 
 Output runs until **`stop_waveform(channel=0)`** (0 = all channels) or `disconnect_device`.
 
@@ -199,7 +213,12 @@ The 16 DIO pins are 3.3 V logic (5 V tolerant) and are shared by three instrumen
 - `idle`: `initial`, `low`, `high`, `high_impedance`
 - `run_time_s`, `wait_s`, `repeat`: burst control, shared by all pattern channels
 
+- `output`: driver type `push_pull`, `open_drain`, `open_source`, `three_state`
+- `trigger_source`, `trigger_slope`, `repeat_trigger`: arm the pattern generator to start on an event (shared by all pins)
+
 The result reports the frequency actually produced. **`stop_pattern(channel?)`** stops one pin or all of them.
+
+**`generate_bus_pattern(pins, words, bit_rate=1e6, ...)`** plays a sequence of words across several pins in parallel (bit i of each word drives `pins[i]`), for bus emulation or counters.
 
 **`capture_logic`** performs one logic analyzer acquisition.
 
@@ -210,6 +229,11 @@ The result reports the frequency actually produced. **`stop_pattern(channel?)`**
 | `buffer_size` | `0` | Samples; 0 = maximum (4096 by default, 16384 with configuration 3) |
 | `trigger_pin` | none | Pin whose edge starts the capture |
 | `trigger_edge` | `"rising"` | `rising`, `falling` or `either` |
+| `trigger_rising`, `trigger_falling` | none | Pins where an edge triggers (any of them) |
+| `trigger_high`, `trigger_low` | none | Pins that must be at that level when the edge occurs |
+| `trigger_count` | `1` | Trigger on the Nth occurrence |
+| `trigger_length_min_s`, `trigger_length_max_s` | `0` | The condition must hold this long (pulse-width trigger) |
+| `trigger_source`, `trigger_slope` | `"logic"`, `"rising"` | Or start from `scope`, `pattern`, `wavegen1/2`, `pc`, `external1`..`4` |
 | `pretrigger_samples` | `0` | Samples kept from before the edge |
 | `trigger_timeout_s` | `1.0` | Auto-trigger after this long; 0 = never |
 | `max_wait_s` | `5.0` | Hard limit on how long the tool waits |
@@ -217,6 +241,10 @@ The result reports the frequency actually produced. **`stop_pattern(channel?)`**
 | `save_csv`, `csv_path` | `true`, auto | As for `capture_waveform` |
 
 Per pin the result gives `initial_level`, `final_level`, `transitions`, `high_fraction`, `frequency_hz_estimate` and `edges` as `[time_s, new_level]` pairs; `active_pins` lists the pins that toggled. The CSV has a column per pin plus the raw 16-bit value.
+
+**`record_logic(pins?, sampling_frequency=1e6, duration_s=0.1, ...)`** streams a record longer than the buffer (up to 4,000,000 samples) with the same summaries and trigger options. **`measure_pin_frequency(pin, gate_time_s=0.1)`** counts rising edges on a pin (software-counted on the AD2).
+
+**`set_trigger_pin(pin, source)`** drives T1 or T2 as an output from an instrument event (`scope`, `logic`, `pattern`, `wavegen1`, `wavegen2`, `pc`, ...) so the AD2 can trigger other equipment; `source="none"` returns it to an input. **`send_pc_trigger`** fires the software trigger for anything armed with `trigger_source="pc"`.
 
 ### Protocols (UART, SPI, I2C)
 

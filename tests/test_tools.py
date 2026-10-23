@@ -17,6 +17,8 @@ def test_tool_list_is_complete(server):
         "generate_pattern", "stop_pattern", "capture_logic", "uart_send", "uart_receive",
         "spi_transfer", "i2c_scan", "i2c_write", "i2c_read", "i2c_write_read", "i2c_spy",
         "capture_spectrum", "network_analyzer", "impedance_analyzer", "sweep_waveform",
+        "record_waveform", "measure_frequency", "record_logic", "measure_pin_frequency",
+        "generate_bus_pattern", "set_trigger_pin", "send_pc_trigger",
     }
 
 

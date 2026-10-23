@@ -98,6 +98,12 @@ class FakeDwf:
         self.analyzer_c = 0.22e-6
         self.analyzer_esr = 5.0
         self.analyzer_frequency = 100.0
+        # record mode: samples handed out per status call; counters: fixed readings, tick advances per call
+        self.record_chunk = 1000
+        self.counter_supported = True        # False models the AD2, which has no hardware counter
+        self.analog_counter_hz = 12345.0
+        self.digital_counter_hz = 1e6
+        self.counter_tick = 0
 
     def calls_to(self, name):
         return [args for called, args in self.calls if called == name]
@@ -199,9 +205,15 @@ class FakeDwf:
         if hasattr(status, "_obj"):
             _set(status, 2 if self.acquisition_done else 1)
 
+    def _h_DigitalInConfigure(self, h, reconfigure, start):
+        if start.value:
+            self.logic_offset = 0
+
     def _h_DigitalInStatusData(self, h, buf, nbytes):
+        offset = getattr(self, "logic_offset", 0)
         for i in range(nbytes.value // 2):
-            buf[i] = self.logic_pattern(i)
+            buf[i] = self.logic_pattern(offset + i)
+        self.logic_offset = offset + nbytes.value // 2
 
     # UART (loopback)
     def _h_DigitalUartTx(self, h, buf, n):
@@ -312,11 +324,39 @@ class FakeDwf:
         if hasattr(status, "_obj"):
             _set(status, 2 if self.acquisition_done else 1)
 
+    def _h_AnalogInConfigure(self, h, reconfigure, start):
+        if start.value:
+            self.analog_offset = 0
+
     def _h_AnalogInStatusData(self, h, ch, buf, n):
+        # record mode reads consecutive chunks: keep the sample index running across calls
+        offset = getattr(self, "analog_offset", 0)
         for i in range(n.value):
-            buf[i] = self.signal(ch.value, i, self.sample_rate)
+            buf[i] = self.signal(ch.value, offset + i, self.sample_rate)
+        if ch.value == 1 or n.value < self.scope_buffer:
+            self.analog_offset = offset + n.value
 
     def _h_AnalogInStatusSample(self, h, ch, out): _set(out, 1.234)
+
+    def _h_AnalogInStatusRecord(self, h, available, lost, corrupt):
+        _set(available, self.record_chunk); _set(lost, 0); _set(corrupt, 0)
+
+    def _h_AnalogInCounterInfo(self, h, count_max, sec_max):
+        _set(count_max, 2 ** 32 if self.counter_supported else 0); _set(sec_max, 10.0 if self.counter_supported else 0.0)
+
+    def _h_DigitalInCounterInfo(self, h, count_max, sec_max):
+        _set(count_max, 2 ** 32 if self.counter_supported else 0); _set(sec_max, 10.0 if self.counter_supported else 0.0)
+
+    def _h_AnalogInCounterStatus(self, h, count, freq, tick):
+        self.counter_tick += 1
+        _set(count, 1234.0); _set(freq, self.analog_counter_hz); _set(tick, self.counter_tick)
+
+    def _h_DigitalInStatusRecord(self, h, available, lost, corrupt):
+        _set(available, self.record_chunk); _set(lost, 0); _set(corrupt, 0)
+
+    def _h_DigitalInCounterStatus(self, h, count, freq, tick):
+        self.counter_tick += 1
+        _set(count, 100000.0); _set(freq, self.digital_counter_hz); _set(tick, self.counter_tick)
 
 
 @pytest.fixture

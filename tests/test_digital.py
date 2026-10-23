@@ -131,7 +131,7 @@ def test_capture_logic_trigger_configuration(server, fake_dwf):
     out = call_tool(server, "capture_logic", sampling_frequency=25e6, buffer_size=1000, trigger_pin=3,
                     trigger_edge="falling", pretrigger_samples=100, save_csv=False)
     assert out["sampling_frequency_hz"] == 25e6 and out["samples"] == 1000
-    assert out["trigger"] == {"pin": 3, "edge": "falling", "index": 100, "time_s": 100 / 25e6}
+    assert out["trigger"] == {"source": "logic", "pin": 3, "edge": "falling", "index": 100, "time_s": 100 / 25e6}
     (div,) = fake_dwf.calls_to("FDwfDigitalInDividerSet")
     assert div[1].value == 4
     (trig,) = fake_dwf.calls_to("FDwfDigitalInTriggerSet")

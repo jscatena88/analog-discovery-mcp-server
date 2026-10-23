@@ -20,7 +20,7 @@ except (ImportError, OSError) as e:
     sys.exit(1)
 
 from ad2 import (analogio, analysis, analyzer, bytesutil, digital, export, i2c, logic, pattern, scope,
-                 spectrum, spi, uart, wavegen)
+                 spectrum, spi, triggers, uart, wavegen)
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
@@ -37,13 +37,19 @@ Tools by instrument:
 - Device: list_devices, connect_device (firmware configuration: 0 default, 1 = 16k scope buffer,
   3 = 16k logic buffers), get_device_info, get_system_status (temperature, USB power, supply
   state), disconnect_device (stops every output and releases the device).
-- Scope: capture_waveform (1-2 channels, edge trigger from ch1/ch2/wavegen1/wavegen2/external1-4,
-  8192 samples by default), measure_voltage (DC voltmeter), capture_spectrum (FFT, peaks, THD).
-- Generator: generate_waveform (standard shapes, custom samples, bursts, phase), sweep_waveform,
-  stop_waveform.
+- Scope: capture_waveform (1-2 channels, 8192 samples; edge/pulse/transition/window trigger from
+  ch1/ch2, or start from wavegen, pattern, logic, pc or external T1-T4), record_waveform (long
+  records streamed over USB, up to 2M samples), measure_voltage (DC voltmeter), measure_frequency,
+  capture_spectrum (FFT, peaks, THD).
+- Generator: generate_waveform (standard shapes, custom samples, bursts, phase, triggered start),
+  sweep_waveform, stop_waveform.
 - Supplies: set_power_supplies, disable_power_supplies.
-- Digital: read_digital_pins, write_digital_pins (static I/O), generate_pattern and stop_pattern
-  (clocks to 50 MHz, pulses, custom bit streams), capture_logic (16 pins, 100 MS/s, edge trigger).
+- Digital: read_digital_pins, write_digital_pins (static I/O), generate_pattern, generate_bus_pattern
+  (parallel words across pins) and stop_pattern (clocks to 50 MHz, pulses, custom bit streams,
+  triggered start), capture_logic (16 pins, 100 MS/s, multi-pin level/edge trigger with count and
+  pulse-length conditions), record_logic (long records, up to 4M samples), measure_pin_frequency.
+- Triggers: set_trigger_pin drives T1/T2 from an instrument event; send_pc_trigger fires anything
+  armed with trigger_source "pc". Every instrument can start from any other.
 - Protocols on any DIO pins: uart_send, uart_receive, spi_transfer, i2c_scan, i2c_write, i2c_read,
   i2c_write_read, i2c_spy.
 - Analyzers: network_analyzer (Bode: gain/phase of ch2 relative to ch1 while W1 sweeps) and
@@ -187,6 +193,13 @@ def capture_waveform(
     preview_points: int = 200,
     save_csv: bool = True,
     csv_path: str | None = None,
+    trigger_type: str = "edge",
+    trigger_length_s: float = 0.0,
+    trigger_length_condition: str = "more",
+    trigger_holdoff_s: float = 0.0,
+    trigger_hysteresis_v: float | None = None,
+    filter: str = "decimate",
+    attenuation: float = 1.0,
 ) -> dict[str, Any]:
     """Single-shot oscilloscope capture. Returns per-channel statistics (min, max, mean, Vpp, RMS,
     estimated frequency), a decimated preview, and the path of a CSV holding every sample.
@@ -197,38 +210,121 @@ def capture_waveform(
         buffer_size: Samples per channel; 0 = device maximum (8192 by default).
         range_volts: Full-scale input range per channel (±range_volts). 5 V or 50 V on the AD2.
         offset_volts: Input offset in volts.
-        trigger_source: none, ch1, ch2, wavegen1, wavegen2, external1..external4.
-        trigger_level: Trigger threshold in volts (analog sources).
-        trigger_edge: rising or falling.
+        trigger_source: none, ch1, ch2 (level trigger on that input), wavegen1, wavegen2, pattern
+            (pattern generator start), logic (the logic analyzer's pin condition), pc
+            (send_pc_trigger), external1..external4 (T1..T4 pins).
+        trigger_level: Trigger threshold in volts (ch1/ch2 sources).
+        trigger_edge: rising, falling or either. For pulse type: rising = positive pulse.
         trigger_timeout_s: Auto-trigger after this long without a trigger event (0 = never).
         max_wait_s: Hard limit on how long the tool waits for the acquisition to finish.
         preview_points: Number of decimated samples returned inline per channel.
         save_csv: Write the full capture to disk.
         csv_path: Where to write the CSV; default is a timestamped file under ./captures
             (override the directory with the AD2_CAPTURE_DIR environment variable).
+        trigger_type: edge (default), pulse (pulse width vs trigger_length_s), transition (time to
+            cross the hysteresis band vs trigger_length_s), window (leaving/entering level ± hysteresis).
+        trigger_length_s: Duration compared by pulse/transition types.
+        trigger_length_condition: more, less or timeout (for pulse/transition).
+        trigger_holdoff_s: Minimum time between triggers.
+        trigger_hysteresis_v: Trigger hysteresis / window half-width; device default when omitted.
+        filter: Per-sample reduction when the ADC runs faster than the sample rate: decimate,
+            average (lower noise) or min_max (keeps glitches).
+        attenuation: Probe factor, e.g. 10 for a 10x probe; reported volts are scaled by it.
     """
     with tool_errors():
         fs, data = scope.capture(session, channels, sampling_frequency, buffer_size, range_volts,
                                  offset_volts, trigger_source, trigger_level, trigger_edge,
-                                 trigger_timeout_s, max_wait_s)
-        n = len(next(iter(data.values())))
-        preview = {"time_s": analysis.time_axis(n, fs, preview_points)}
-        channel_stats = {}
-        for ch, samples in data.items():
-            channel_stats[f"ch{ch}"] = analysis.summarize(samples, fs)
-            preview[f"ch{ch}"] = analysis.decimate(samples, preview_points)
-        path = export.write_capture_csv(csv_path, fs, data) if save_csv else None
-        return {
-            "sampling_frequency_hz": fs,
-            "samples_per_channel": n,
-            "duration_s": n / fs,
+                                 trigger_timeout_s, max_wait_s, trigger_type, trigger_length_s,
+                                 trigger_length_condition, trigger_holdoff_s, trigger_hysteresis_v,
+                                 filter, attenuation)
+        result = _capture_result(fs, data, preview_points, save_csv, csv_path)
+        result.update({
             "range_volts": range_volts,
             "offset_volts": offset_volts,
-            "trigger": {"source": trigger_source, "level_v": trigger_level, "edge": trigger_edge},
-            "channels": channel_stats,
-            "preview": preview,
-            "csv_path": path,
-        }
+            "trigger": {"source": trigger_source, "type": trigger_type, "level_v": trigger_level,
+                        "edge": trigger_edge},
+        })
+        return result
+
+
+def _capture_result(fs, data, preview_points, save_csv, csv_path, **extra):
+    n = len(next(iter(data.values())))
+    preview = {"time_s": analysis.time_axis(n, fs, preview_points)}
+    channel_stats = {}
+    for ch, samples in data.items():
+        channel_stats[f"ch{ch}"] = analysis.summarize(samples, fs)
+        preview[f"ch{ch}"] = analysis.decimate(samples, preview_points)
+    path = export.write_capture_csv(csv_path, fs, data) if save_csv else None
+    return {
+        "sampling_frequency_hz": fs,
+        "samples_per_channel": n,
+        "duration_s": n / fs,
+        "channels": channel_stats,
+        "preview": preview,
+        "csv_path": path,
+        **extra,
+    }
+
+
+@mcp.tool()
+def record_waveform(
+    channels: list[int] | None = None,
+    sampling_frequency: float = 100e3,
+    duration_s: float = 1.0,
+    range_volts: float = 5.0,
+    offset_volts: float = 0.0,
+    trigger_source: str = "none",
+    trigger_level: float = 0.0,
+    trigger_edge: str = "rising",
+    trigger_timeout_s: float = 1.0,
+    max_wait_s: float | None = None,
+    preview_points: int = 500,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+    filter: str = "decimate",
+    attenuation: float = 1.0,
+) -> dict[str, Any]:
+    """Record a waveform longer than the scope buffer by streaming samples over USB (up to
+    2,000,000 samples per channel). Suited to sample rates up to about 1 MS/s; the result reports
+    samples lost or corrupted if the host could not keep up. Statistics, preview and CSV as for
+    capture_waveform.
+
+    Args:
+        channels: Scope channels, default all.
+        sampling_frequency: Sample rate in Hz.
+        duration_s: Record length in seconds (duration_s * sampling_frequency samples).
+        range_volts, offset_volts, filter, attenuation: As for capture_waveform.
+        trigger_source, trigger_level, trigger_edge, trigger_timeout_s: Edge trigger that starts the record.
+        max_wait_s: Hard limit; default duration_s + 5.
+        preview_points, save_csv, csv_path: Output options.
+    """
+    with tool_errors():
+        fs, data, lost, corrupted = scope.record(session, channels, sampling_frequency, duration_s, range_volts,
+                                                 offset_volts, trigger_source, trigger_level, trigger_edge,
+                                                 trigger_timeout_s, max_wait_s, filter, attenuation)
+        return _capture_result(fs, data, preview_points, save_csv, csv_path, samples_lost=lost,
+                               samples_corrupted=corrupted, range_volts=range_volts,
+                               trigger={"source": trigger_source, "level_v": trigger_level, "edge": trigger_edge})
+
+
+@mcp.tool()
+def measure_frequency(channel: int = 1, gate_time_s: float = 0.1, trigger_level: float = 0.0,
+                      trigger_hysteresis_v: float | None = None, range_volts: float = 5.0,
+                      offset_volts: float = 0.0) -> dict[str, Any]:
+    """Frequency counter on a scope channel. Uses the hardware counter on devices that have one;
+    on the Analog Discovery 2 (which has none) it counts level crossings in a 100 MS/s capture, or in
+    a record spanning gate_time_s for signals below about 50 kHz. The result's `method` says which.
+
+    Args:
+        channel: Scope channel, 1 or 2.
+        gate_time_s: Counting window; longer gives more resolution.
+        trigger_level: Crossing level in volts.
+        trigger_hysteresis_v: Noise rejection band; device default when omitted.
+        range_volts, offset_volts: Input range and offset.
+    """
+    with tool_errors():
+        return scope.count_frequency(session, channel, gate_time_s, trigger_level, trigger_hysteresis_v,
+                                     range_volts, offset_volts)
 
 
 @mcp.tool()
@@ -295,9 +391,12 @@ def generate_waveform(
     data: list[float] | None = None,
     phase_deg: float = 0.0,
     start_all_channels: bool = False,
+    trigger_source: str = "none",
+    trigger_slope: str = "rising",
+    repeat_trigger: bool = False,
 ) -> dict[str, Any]:
     """Start a waveform on W1 or W2. The output keeps running until stop_waveform or
-    disconnect_device.
+    disconnect_device. With a trigger_source the channel arms and starts on that event.
 
     Args:
         channel: Generator channel, 1 (W1) or 2 (W2).
@@ -316,10 +415,16 @@ def generate_waveform(
             started together).
         start_all_channels: Restart every configured generator channel together so W1 and W2
             are phase-aligned.
+        trigger_source: none (start now), pc (send_pc_trigger), scope (scope trigger detector),
+            logic (logic analyzer pin condition), pattern, wavegen1/wavegen2 (the other channel),
+            external1..external4.
+        trigger_slope: rising, falling or either.
+        repeat_trigger: Wait for the trigger before every repeat, not only the first.
     """
     with tool_errors():
         return wavegen.generate(session, channel, function, frequency, amplitude, offset,
-                                symmetry, run_time_s, wait_s, repeat, data, phase_deg, start_all_channels)
+                                symmetry, run_time_s, wait_s, repeat, data, phase_deg, start_all_channels,
+                                trigger_source, trigger_slope, repeat_trigger)
 
 
 @mcp.tool()
@@ -332,13 +437,38 @@ def sweep_waveform(
     offset: float = 0.0,
     function: str = "sine",
     repeat: int = 0,
+    trigger_source: str = "none",
+    trigger_slope: str = "rising",
+    repeat_trigger: bool = False,
 ) -> dict[str, Any]:
     """Linear frequency sweep on W1 or W2 from start_frequency to stop_frequency over sweep_time_s,
     repeating until stop_waveform (or `repeat` times). Use capture_waveform with
-    trigger_source wavegen1/wavegen2 to catch the start of a sweep."""
+    trigger_source wavegen1/wavegen2 to catch the start of a sweep. trigger_source arms the
+    sweep to start on an event, as for generate_waveform."""
     with tool_errors():
         return wavegen.sweep(session, channel, start_frequency, stop_frequency, sweep_time_s, amplitude,
-                             offset, function, repeat)
+                             offset, function, repeat, trigger_source, trigger_slope, repeat_trigger)
+
+
+@mcp.tool()
+def set_trigger_pin(pin: int, source: str = "none") -> dict[str, Any]:
+    """Drive trigger pin T1 or T2 as an output from an instrument event, so the AD2 can trigger
+    other equipment, or return it to an input with source "none".
+
+    Args:
+        pin: 1 for T1, 2 for T2.
+        source: none (input), pc, scope, logic, scope_start, logic_start, pattern, wavegen1, wavegen2.
+    """
+    with tool_errors():
+        return triggers.set_pin_output(session.ensure(), pin, source)
+
+
+@mcp.tool()
+def send_pc_trigger() -> dict[str, Any]:
+    """Fire the software trigger. Anything armed with trigger_source "pc" (scope, logic analyzer,
+    generator, pattern generator, or a trigger pin output) starts now."""
+    with tool_errors():
+        return triggers.pc_trigger(session.ensure())
 
 
 @mcp.tool()
@@ -452,6 +582,10 @@ def generate_pattern(
     run_time_s: float = 0.0,
     wait_s: float = 0.0,
     repeat: int = 0,
+    output: str = "push_pull",
+    trigger_source: str = "none",
+    trigger_slope: str = "rising",
+    repeat_trigger: bool = False,
 ) -> dict[str, Any]:
     """Start a digital pattern on a DIO pin. Runs until stop_pattern or disconnect_device.
 
@@ -467,10 +601,46 @@ def generate_pattern(
         run_time_s: Burst length in seconds; 0 = continuous. Shared by all pattern channels.
         wait_s: Delay before each burst. Shared by all pattern channels.
         repeat: Number of bursts; 0 = forever. Shared by all pattern channels.
+        output: Driver type: push_pull, open_drain, open_source or three_state.
+        trigger_source: none (start now), pc, scope, logic, wavegen1, wavegen2, external1..4.
+            Shared by all pattern channels.
+        trigger_slope: rising, falling or either.
+        repeat_trigger: Wait for the trigger before every repeat.
     """
     with tool_errors():
         return pattern.generate(session, channel, kind, frequency, duty_cycle, data, idle,
-                                run_time_s, wait_s, repeat)
+                                run_time_s, wait_s, repeat, output, trigger_source, trigger_slope,
+                                repeat_trigger)
+
+
+@mcp.tool()
+def generate_bus_pattern(
+    pins: list[int],
+    words: list[int],
+    bit_rate: float = 1e6,
+    idle: str = "initial",
+    run_time_s: float = 0.0,
+    wait_s: float = 0.0,
+    repeat: int = 0,
+    output: str = "push_pull",
+    trigger_source: str = "none",
+    trigger_slope: str = "rising",
+    repeat_trigger: bool = False,
+) -> dict[str, Any]:
+    """Play a sequence of words across several DIO pins in parallel: bit i of each word drives
+    pins[i]. Emulates a parallel bus, a counter, or a multi-signal timing pattern. The sequence
+    repeats until stop_pattern unless run_time_s/repeat limit it.
+
+    Args:
+        pins: DIO pins, least significant bit first, e.g. [0, 1, 2, 3] for a 4-bit bus.
+        words: Values to play, one per bit period, each below 2 ** len(pins). Up to 1024.
+        bit_rate: Words per second.
+        idle, run_time_s, wait_s, repeat, output, trigger_source, trigger_slope, repeat_trigger:
+            As for generate_pattern.
+    """
+    with tool_errors():
+        return pattern.generate_bus(session, pins, words, bit_rate, idle, run_time_s, wait_s, repeat, output,
+                                    trigger_source, trigger_slope, repeat_trigger)
 
 
 @mcp.tool()
@@ -495,6 +665,15 @@ def capture_logic(
     max_edges: int = 100,
     save_csv: bool = True,
     csv_path: str | None = None,
+    trigger_rising: list[int] | None = None,
+    trigger_falling: list[int] | None = None,
+    trigger_high: list[int] | None = None,
+    trigger_low: list[int] | None = None,
+    trigger_count: int = 1,
+    trigger_length_min_s: float = 0.0,
+    trigger_length_max_s: float = 0.0,
+    trigger_source: str = "logic",
+    trigger_slope: str = "rising",
 ) -> dict[str, Any]:
     """Single-shot logic analyzer capture of DIO 0-15. Returns, per pin, the initial and final
     level, transition count, high fraction, estimated frequency and the first transitions as
@@ -504,34 +683,104 @@ def capture_logic(
         pins: Pins to report on (default: all 16). All pins are always captured and saved.
         sampling_frequency: Sample rate in Hz, up to 100e6. Duration = buffer_size / rate.
         buffer_size: Samples; 0 = configuration maximum (4096 by default, 16384 with configuration 3).
-        trigger_pin: Pin whose edge starts the capture; omit to capture immediately.
-        trigger_edge: rising, falling or either.
-        pretrigger_samples: Samples to keep from before the trigger edge.
-        trigger_timeout_s: Auto-trigger after this long without an edge; 0 = never.
+        trigger_pin: Pin whose edge starts the capture; omit (and give no other trigger lists)
+            to capture immediately.
+        trigger_edge: rising, falling or either, for trigger_pin.
+        pretrigger_samples: Samples to keep from before the trigger.
+        trigger_timeout_s: Auto-trigger after this long without a trigger; 0 = never.
         max_wait_s: Hard limit on how long the tool waits.
         max_edges: Maximum transitions listed inline per pin.
         save_csv: Write the full capture to disk.
         csv_path: Where to write it; default is a timestamped file under ./captures.
+        trigger_rising, trigger_falling: Pins where an edge triggers (any one of them).
+        trigger_high, trigger_low: Pins that must be at that level when the edge occurs.
+        trigger_count: Trigger on the Nth occurrence of the condition.
+        trigger_length_min_s, trigger_length_max_s: The condition must hold for at least min
+            (and, if max > 0, at most max) seconds, e.g. to catch a pulse of a given width.
+        trigger_source: logic (the pin condition above), or scope, pattern, wavegen1, wavegen2, pc,
+            external1..4 to start from another instrument.
+        trigger_slope: Edge for non-logic sources.
     """
     with tool_errors():
         dd = session.ensure()
         pins = digital.check_pins(dd, pins, "pins") or list(range(digital.pin_count(dd)))
         fs, samples, trigger_index = logic.capture(session, sampling_frequency, buffer_size, trigger_pin,
                                                    trigger_edge, pretrigger_samples, trigger_timeout_s,
-                                                   max_wait_s)
-        summaries = {f"dio{p}": logic.summarize_pin(samples, p, fs, max_edges) for p in pins}
-        path = logic.write_logic_csv(csv_path, fs, samples, digital.pin_count(dd)) if save_csv else None
-        return {
-            "sampling_frequency_hz": fs,
-            "samples": len(samples),
-            "duration_s": len(samples) / fs,
-            "trigger": None if trigger_pin is None else
-                {"pin": trigger_pin, "edge": trigger_edge, "index": trigger_index,
-                 "time_s": trigger_index / fs},
-            "active_pins": [p for p in pins if summaries[f"dio{p}"]["transitions"]],
-            "pins": summaries,
-            "csv_path": path,
-        }
+                                                   max_wait_s, trigger_rising, trigger_falling, trigger_high,
+                                                   trigger_low, trigger_count, trigger_length_min_s,
+                                                   trigger_length_max_s, trigger_source, trigger_slope)
+        return _logic_result(dd, fs, samples, pins, max_edges, save_csv, csv_path,
+                             trigger=None if trigger_index is None else
+                             {"source": trigger_source, "pin": trigger_pin, "edge": trigger_edge,
+                              "index": trigger_index, "time_s": trigger_index / fs})
+
+
+def _logic_result(dd, fs, samples, pins, max_edges, save_csv, csv_path, **extra):
+    summaries = {f"dio{p}": logic.summarize_pin(samples, p, fs, max_edges) for p in pins}
+    path = logic.write_logic_csv(csv_path, fs, samples, digital.pin_count(dd)) if save_csv else None
+    return {
+        "sampling_frequency_hz": fs,
+        "samples": len(samples),
+        "duration_s": len(samples) / fs,
+        "active_pins": [p for p in pins if summaries[f"dio{p}"]["transitions"]],
+        "pins": summaries,
+        "csv_path": path,
+        **extra,
+    }
+
+
+@mcp.tool()
+def record_logic(
+    pins: list[int] | None = None,
+    sampling_frequency: float = 1e6,
+    duration_s: float = 0.1,
+    trigger_pin: int | None = None,
+    trigger_edge: str = "rising",
+    trigger_timeout_s: float = 1.0,
+    max_wait_s: float | None = None,
+    max_edges: int = 100,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+    trigger_rising: list[int] | None = None,
+    trigger_falling: list[int] | None = None,
+    trigger_high: list[int] | None = None,
+    trigger_low: list[int] | None = None,
+    trigger_source: str = "logic",
+) -> dict[str, Any]:
+    """Record DIO 0-15 for longer than the logic buffer by streaming over USB (up to 4,000,000
+    samples). Suited to sample rates up to a few MS/s; the result reports lost samples if the
+    host could not keep up. Per-pin summaries and CSV as for capture_logic.
+
+    Args:
+        pins: Pins to summarize; all pins are captured and saved.
+        sampling_frequency: Sample rate in Hz.
+        duration_s: Record length in seconds.
+        trigger_pin, trigger_edge, trigger_rising, trigger_falling, trigger_high, trigger_low,
+            trigger_timeout_s, trigger_source: Trigger that starts the record, as for capture_logic.
+        max_wait_s: Hard limit; default duration_s + 5.
+        max_edges, save_csv, csv_path: Output options.
+    """
+    with tool_errors():
+        dd = session.ensure()
+        pins = digital.check_pins(dd, pins, "pins") or list(range(digital.pin_count(dd)))
+        fs, samples, lost, corrupted = logic.record(session, sampling_frequency, duration_s, trigger_pin,
+                                                    trigger_edge, trigger_timeout_s, max_wait_s, trigger_rising,
+                                                    trigger_falling, trigger_high, trigger_low, trigger_source)
+        return _logic_result(dd, fs, samples, pins, max_edges, save_csv, csv_path,
+                             samples_lost=lost, samples_corrupted=corrupted)
+
+
+@mcp.tool()
+def measure_pin_frequency(pin: int = 0, gate_time_s: float = 0.1) -> dict[str, Any]:
+    """Frequency counter on a DIO pin: hardware counter where the device has one, otherwise rising
+    edges counted in a 100 MS/s capture or in a record spanning gate_time_s (AD2).
+
+    Args:
+        pin: DIO pin number, 0-15.
+        gate_time_s: Counting window; longer gives more resolution.
+    """
+    with tool_errors():
+        return logic.count_frequency(session, pin, gate_time_s)
 
 
 # --------------------------------------------------------------------------- UART

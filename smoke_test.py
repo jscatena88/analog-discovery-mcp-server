@@ -172,6 +172,61 @@ def main():
         expect(f and abs(f - 1e6) < 2e4, f"DIO0 reads {f} Hz")
         return f"1 MHz clock on DIO0 read back as {f / 1e6:.3f} MHz"
 
+    @check("record_logic + measure_pin_frequency")
+    def _():
+        call("generate_pattern", channel=0, kind="clock", frequency=100e3)
+        rec = call("record_logic", pins=[0], sampling_frequency=1e6, duration_s=0.05, save_csv=False)
+        freq = call("measure_pin_frequency", pin=0, gate_time_s=0.05)
+        call("stop_pattern")
+        expect(rec["samples"] == 50000 and rec["samples_lost"] == 0, f"record {rec['samples']} samples, lost {rec['samples_lost']}")
+        expect(abs(freq["frequency_hz"] - 100e3) < 200, f"counter read {freq['frequency_hz']}")
+        return f"50 ms record, {rec['pins']['dio0']['transitions']} transitions; counter {freq['frequency_hz']:.0f} Hz ({freq['method']})"
+
+    @check("generate_bus_pattern")
+    def _():
+        call("generate_bus_pattern", pins=[0, 1, 2], words=list(range(8)), bit_rate=1e6)
+        out = call("capture_logic", pins=[0, 1, 2], trigger_pin=2, save_csv=False)
+        call("stop_pattern")
+        f = [out["pins"][f"dio{p}"]["frequency_hz_estimate"] for p in (0, 1, 2)]
+        expect(all(abs(m - e) < 0.02 * e for m, e in zip(f, (500e3, 250e3, 125e3))), f"bus frequencies {f}")
+        return "3-bit counter on DIO0-2 reads 500/250/125 kHz"
+
+    @check("pc trigger -> pattern start")
+    def _():
+        call("generate_pattern", channel=0, kind="clock", frequency=1e6, trigger_source="pc")
+        before = call("capture_logic", pins=[0], save_csv=False)["pins"]["dio0"]["transitions"]
+        call("send_pc_trigger")
+        after = call("capture_logic", pins=[0], save_csv=False)["pins"]["dio0"]["transitions"]
+        call("stop_pattern")
+        expect(before <= 1 < after, f"transitions before/after trigger: {before}/{after}")
+        return f"idle until send_pc_trigger, then {after} transitions per capture"
+
+    @check("record_waveform + measure_frequency", "analog-bench", args.analog_bench)
+    def _():
+        call("generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
+        rec = call("record_waveform", channels=[1], sampling_frequency=100e3, duration_s=0.5, save_csv=False)
+        freq = call("measure_frequency", channel=1, gate_time_s=0.2)
+        call("stop_waveform")
+        expect(rec["samples_per_channel"] == 50000 and rec["samples_lost"] == 0, f"record lost {rec['samples_lost']}")
+        expect(abs(freq["frequency_hz"] - 1e3) < 2, f"counter read {freq['frequency_hz']}")
+        return f"0.5 s record of 1 kHz sine; counter {freq['frequency_hz']:.1f} Hz ({freq['method']})"
+
+    @check("pulse-width trigger", "analog-bench", args.analog_bench)
+    def _():
+        call("generate_waveform", channel=1, function="square", frequency=1e3, amplitude=1.0, symmetry=20)
+        call("capture_waveform", channels=[1], sampling_frequency=1e6, trigger_source="ch1", trigger_type="pulse",
+             trigger_length_s=100e-6, trigger_length_condition="more", trigger_timeout_s=0, max_wait_s=2, save_csv=False)
+        try:
+            call("capture_waveform", channels=[1], sampling_frequency=1e6, trigger_source="ch1", trigger_type="pulse",
+                 trigger_length_s=500e-6, trigger_length_condition="more", trigger_timeout_s=0, max_wait_s=0.5,
+                 save_csv=False)
+            raise AssertionError("a 500 us minimum width should not trigger on 200 us pulses")
+        except RuntimeError:
+            pass
+        finally:
+            call("stop_waveform")
+        return "200 us pulses: triggers at >100 us, not at >500 us"
+
     @check("uart loopback", "jumpered", args.jumpered)
     def _():
         out = call("uart_send", data="smoke\r\n", tx_pin=0, rx_pin=8, baud_rate=115200)

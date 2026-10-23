@@ -219,6 +219,109 @@ def test_sweep_waveform_start_and_end_frequency(hw):
     call_tool(hw, "stop_waveform")
 
 
+@analog_bench
+def test_record_waveform_long_capture(hw):
+    call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
+    out = call_tool(hw, "record_waveform", channels=[1], sampling_frequency=100e3, duration_s=0.5, save_csv=False)
+    call_tool(hw, "stop_waveform")
+    assert out["samples_per_channel"] == 50000 and out["samples_lost"] == 0
+    assert abs(out["channels"]["ch1"]["frequency_hz_estimate"] - 1e3) < 5
+    assert abs(out["channels"]["ch1"]["peak_to_peak_v"] - 2.0) < 0.2
+
+
+@analog_bench
+def test_measure_frequency_counter(hw):
+    call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=12345.0, amplitude=1.0)
+    out = call_tool(hw, "measure_frequency", channel=1, gate_time_s=0.2)
+    call_tool(hw, "stop_waveform")
+    assert abs(out["frequency_hz"] - 12345.0) < 2, out
+
+
+@analog_bench
+def test_pulse_width_trigger(hw):
+    # 1 kHz square at 20 % duty: positive pulses of 200 us on channel 1
+    call_tool(hw, "generate_waveform", channel=1, function="square", frequency=1e3, amplitude=1.0, symmetry=20)
+    out = call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=1e6, trigger_source="ch1",
+                    trigger_type="pulse", trigger_level=0.0, trigger_edge="rising", trigger_length_s=100e-6,
+                    trigger_length_condition="more", trigger_timeout_s=0, max_wait_s=2, save_csv=False)
+    assert out["trigger"]["type"] == "pulse"
+    with pytest.raises(RuntimeError, match="did not complete"):
+        call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=1e6, trigger_source="ch1",
+                  trigger_type="pulse", trigger_level=0.0, trigger_edge="rising", trigger_length_s=500e-6,
+                  trigger_length_condition="more", trigger_timeout_s=0, max_wait_s=0.5, save_csv=False)
+    call_tool(hw, "stop_waveform")
+
+
+@analog_bench
+def test_generator_waits_for_pc_trigger(hw):
+    out = call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0,
+                    trigger_source="pc")
+    assert out["armed"] is True
+    quiet = call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=100e3, save_csv=False)
+    assert quiet["channels"]["ch1"]["peak_to_peak_v"] < 0.2
+    call_tool(hw, "send_pc_trigger")
+    running = call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=100e3, save_csv=False)
+    assert running["channels"]["ch1"]["peak_to_peak_v"] > 1.8
+    call_tool(hw, "stop_waveform")
+
+
+def test_measure_pin_frequency_counter(hw):
+    call_tool(hw, "generate_pattern", channel=0, kind="clock", frequency=1e6)
+    out = call_tool(hw, "measure_pin_frequency", pin=0, gate_time_s=0.1)
+    call_tool(hw, "stop_pattern")
+    assert abs(out["frequency_hz"] - 1e6) < 100, out
+
+
+def test_bus_pattern_counts_on_three_pins(hw):
+    call_tool(hw, "generate_bus_pattern", pins=[0, 1, 2], words=list(range(8)), bit_rate=1e6)
+    out = call_tool(hw, "capture_logic", pins=[0, 1, 2], trigger_pin=2, save_csv=False)
+    call_tool(hw, "stop_pattern")
+    freqs = [out["pins"][f"dio{p}"]["frequency_hz_estimate"] for p in (0, 1, 2)]
+    for measured, expected in zip(freqs, (500e3, 250e3, 125e3)):
+        assert abs(measured - expected) < 0.02 * expected, freqs
+
+
+def test_record_logic_long_capture(hw):
+    call_tool(hw, "generate_pattern", channel=0, kind="clock", frequency=100e3)
+    out = call_tool(hw, "record_logic", pins=[0], sampling_frequency=1e6, duration_s=0.05, save_csv=False)
+    call_tool(hw, "stop_pattern")
+    assert out["samples"] == 50000 and out["samples_lost"] == 0
+    assert abs(out["pins"]["dio0"]["transitions"] - 10000) <= 2
+    assert abs(out["pins"]["dio0"]["frequency_hz_estimate"] - 100e3) < 100
+
+
+def test_logic_trigger_gated_by_pin_level(hw):
+    call_tool(hw, "generate_pattern", channel=0, kind="clock", frequency=1e6)
+    call_tool(hw, "write_digital_pins", high=[1])
+    out = call_tool(hw, "capture_logic", pins=[0, 1], trigger_rising=[0], trigger_high=[1], trigger_timeout_s=0,
+                    max_wait_s=1, save_csv=False)
+    assert out["pins"]["dio1"]["high_fraction"] == 1.0
+    call_tool(hw, "write_digital_pins", low=[1])
+    with pytest.raises(RuntimeError, match="did not complete"):
+        call_tool(hw, "capture_logic", pins=[0, 1], trigger_rising=[0], trigger_high=[1], trigger_timeout_s=0,
+                  max_wait_s=0.5, save_csv=False)
+    call_tool(hw, "write_digital_pins", inputs=[1])
+    call_tool(hw, "stop_pattern")
+
+
+def test_pattern_waits_for_pc_trigger(hw):
+    out = call_tool(hw, "generate_pattern", channel=0, kind="clock", frequency=1e6, trigger_source="pc")
+    assert out["armed"] is True
+    quiet = call_tool(hw, "capture_logic", pins=[0], save_csv=False)
+    assert quiet["pins"]["dio0"]["transitions"] <= 1
+    call_tool(hw, "send_pc_trigger")
+    running = call_tool(hw, "capture_logic", pins=[0], save_csv=False)
+    assert running["pins"]["dio0"]["transitions"] > 70
+    call_tool(hw, "stop_pattern")
+
+
+def test_trigger_pin_output_round_trip(hw):
+    out = call_tool(hw, "set_trigger_pin", pin=1, source="pattern")
+    assert out["direction"] == "output"
+    out = call_tool(hw, "set_trigger_pin", pin=1, source="none")
+    assert out["direction"] == "input"
+
+
 def test_wavegen_trigger_source(hw):
     call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
     out = call_tool(hw, "capture_waveform", channels=[1], trigger_source="wavegen1", trigger_timeout_s=0,

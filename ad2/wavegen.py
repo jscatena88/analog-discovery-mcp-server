@@ -5,7 +5,26 @@ import ctypes
 from WF_SDK import device, wavegen as wf_wavegen
 import dwfconstants as constants
 
+from . import triggers
 from .errors import AD2Error
+
+TRIGGER_SOURCES = ("none", "pc", "scope", "logic", "pattern", "wavegen1", "wavegen2",
+                   "external1", "external2", "external3", "external4")
+
+
+def _set_trigger(dd, channel, trigger_source, trigger_slope, repeat_trigger):
+    if trigger_source not in TRIGGER_SOURCES:
+        raise AD2Error(f"trigger_source must be one of: {', '.join(TRIGGER_SOURCES)}")
+    if trigger_source == f"wavegen{channel}":
+        raise AD2Error("a generator channel cannot trigger from itself")
+    dwf = device.dwf
+    ch = ctypes.c_int(channel - 1)
+    if dwf.FDwfAnalogOutTriggerSourceSet(dd.handle, ch, triggers.SOURCES[trigger_source]) == 0:
+        device.check_error()
+    if dwf.FDwfAnalogOutTriggerSlopeSet(dd.handle, ch, triggers.slope(trigger_slope)) == 0:
+        device.check_error()
+    if dwf.FDwfAnalogOutRepeatTriggerSet(dd.handle, ch, ctypes.c_int(1 if repeat_trigger else 0)) == 0:
+        device.check_error()
 
 FUNCTIONS = {
     "custom": wf_wavegen.function.custom,
@@ -80,7 +99,8 @@ def parse_samples(data, max_samples: int) -> list[float]:
 
 
 def generate(session, channel, function, frequency, amplitude, offset=0.0, symmetry=50.0,
-             run_time_s=0.0, wait_s=0.0, repeat=0, data=None, phase_deg=0.0, start_all_channels=False) -> dict:
+             run_time_s=0.0, wait_s=0.0, repeat=0, data=None, phase_deg=0.0, start_all_channels=False,
+             trigger_source="none", trigger_slope="rising", repeat_trigger=False) -> dict:
     dd = session.ensure()
     _check_channel(dd, channel)
     key = str(function).lower()
@@ -104,6 +124,7 @@ def generate(session, channel, function, frequency, amplitude, offset=0.0, symme
     if device.dwf.FDwfAnalogOutNodePhaseSet(dd.handle, ctypes.c_int(channel - 1), constants.AnalogOutNodeCarrier,
                                             ctypes.c_double(phase_deg)) == 0:
         device.check_error()
+    _set_trigger(dd, channel, trigger_source, trigger_slope, repeat_trigger)
     wf_wavegen.generate(dd, channel, FUNCTIONS[key], offset, frequency if key != "dc" else 1e3,
                         amplitude, symmetry, wait_s, run_time_s, repeat, samples)
     session.wavegen_running.add(channel)
@@ -122,7 +143,11 @@ def generate(session, channel, function, frequency, amplitude, offset=0.0, symme
         "run_time_s": run_time_s,
         "wait_s": wait_s,
         "repeat": repeat,
-        "running": True,
+        "trigger_source": trigger_source,
+        "trigger_slope": trigger_slope,
+        "repeat_trigger": repeat_trigger,
+        "running": trigger_source == "none",
+        "armed": trigger_source != "none",
         "running_channels": sorted(session.wavegen_running),
     }
     if samples:
@@ -132,7 +157,7 @@ def generate(session, channel, function, frequency, amplitude, offset=0.0, symme
 
 
 def sweep(session, channel, start_frequency, stop_frequency, sweep_time_s, amplitude, offset=0.0,
-          function="sine", repeat=0) -> dict:
+          function="sine", repeat=0, trigger_source="none", trigger_slope="rising", repeat_trigger=False) -> dict:
     """Linear frequency sweep using the FM modulation node: carrier at the mid frequency, deviation
     ramped over sweep_time_s. repeat=0 sweeps forever; otherwise the output stops after `repeat` sweeps."""
     dd = session.ensure()
@@ -181,6 +206,7 @@ def sweep(session, channel, start_frequency, stop_frequency, sweep_time_s, ampli
         device.check_error()
     if dwf.FDwfAnalogOutRepeatSet(handle, ch, ctypes.c_int(repeat)) == 0:
         device.check_error()
+    _set_trigger(dd, channel, trigger_source, trigger_slope, repeat_trigger)
     if dwf.FDwfAnalogOutConfigure(handle, ch, ctypes.c_int(1)) == 0:
         device.check_error()
     session.wavegen_running.add(channel)
@@ -195,7 +221,9 @@ def sweep(session, channel, start_frequency, stop_frequency, sweep_time_s, ampli
         "amplitude_v": amplitude,
         "offset_v": offset,
         "repeat": repeat,
-        "running": True,
+        "trigger_source": trigger_source,
+        "running": trigger_source == "none",
+        "armed": trigger_source != "none",
         "running_channels": sorted(session.wavegen_running),
     }
 
