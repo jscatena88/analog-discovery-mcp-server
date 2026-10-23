@@ -1,6 +1,6 @@
 [project]
 name = "analog-discovery-mcp-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for the Digilent Analog Discovery 2 via the WaveForms SDK"
 readme = "README.md"
 license = { file = "LICENSE.md" }
@@ -16,3 +16,6 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

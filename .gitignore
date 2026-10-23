@@ -45,3 +45,6 @@ waveform_data.json
 plot_*.html
 plot_*.py
 extract_*.py
+
+# Scope captures written by the MCP server
+captures/

@@ -4,10 +4,13 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 
 ## Features
 
-- **Device Management**: List, connect, and disconnect Analog Discovery 2 devices
-- **Oscilloscope**: Capture analog waveforms from channels 0 and 1
-- **Waveform Generator**: Generate various waveforms (sine, square, triangle, ramp, DC) on output channels
-- **Device Information**: Get version and device details
+- **Oscilloscope**: single-shot capture on one or both channels with edge triggering, per-channel statistics (min, max, mean, Vpp, RMS, estimated frequency), a decimated preview, and the full record saved as CSV
+- **Voltmeter**: averaged DC readings on either scope channel
+- **Waveform generator**: sine, square, triangle, ramp, DC, noise, pulse, trapezium and sine-power outputs with symmetry/duty and burst (run, wait, repeat) control on W1 and W2
+- **Power supplies**: program and switch V+ / V- with range validation and setpoint/measured readback
+- **System monitor**: board temperature, USB voltage and current, auxiliary input
+- **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
+- **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
 ## Prerequisites
 
@@ -100,145 +103,89 @@ uv run --directory /path/to/analog-discovery-mcp-server server.py
 
 ## Available Tools
 
-### `list_devices`
-List all available Analog Discovery 2 devices connected to the system.
+Every tool returns a JSON object. Failures (bad arguments, device busy, trigger timeout) come back as tool errors with an actionable message. Tools auto-connect to the first device on first use.
 
-**Parameters**: None
+### Device
 
-**Example**:
+| Tool | Purpose |
+|---|---|
+| `list_devices` | Enumerate devices with serial number, type and the firmware configurations each supports (channel counts and buffer sizes). Works without connecting. |
+| `connect_device(device_name?, configuration=0)` | Open a specific device and/or firmware configuration. AD2 configurations: 0 default (8k scope buffer), 1 = 16k scope buffer, 3 = 16k logic buffers with a 512-sample scope. |
+| `disconnect_device` | Stop the generator, turn off the supplies, reset the scope and release the device. |
+| `get_device_info` | Channel counts, buffer sizes, voltage ranges and which instruments are active. |
+| `get_system_status` | Board temperature, USB voltage/current, auxiliary input, and the V+ / V- supply state. |
+
+### Oscilloscope
+
+**`capture_waveform`** performs one acquisition and returns per-channel statistics, a decimated preview, and the path of a CSV containing every sample.
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `channels` | all | List of scope channels, e.g. `[1]` or `[1, 2]` |
+| `sampling_frequency` | `20e6` | Hz, up to 100e6 |
+| `buffer_size` | `0` | Samples per channel; 0 = device maximum |
+| `range_volts` | `5.0` | Full-scale input range (±range); 5 V or 50 V on the AD2 |
+| `offset_volts` | `0.0` | Input offset |
+| `trigger_source` | `"none"` | `none`, `ch1`, `ch2`, `wavegen1`, `wavegen2`, `external1`..`external4` |
+| `trigger_level` | `0.0` | Volts (analog sources) |
+| `trigger_edge` | `"rising"` | `rising` or `falling` |
+| `trigger_timeout_s` | `1.0` | Auto-trigger after this long without an event; 0 = never |
+| `max_wait_s` | `5.0` | Hard limit on how long the tool waits for the acquisition |
+| `preview_points` | `200` | Decimated samples returned inline per channel |
+| `save_csv` | `true` | Write the full capture to disk |
+| `csv_path` | auto | Default: timestamped file under `./captures` (override the directory with `AD2_CAPTURE_DIR`) |
+
+Result shape:
 ```json
 {
-  "tool": "list_devices"
+  "sampling_frequency_hz": 1000000.0,
+  "samples_per_channel": 8192,
+  "duration_s": 0.008192,
+  "trigger": {"source": "ch1", "level_v": 0.5, "edge": "rising"},
+  "channels": {
+    "ch1": {"samples": 8192, "min_v": -1.0, "max_v": 1.0, "mean_v": 0.0, "peak_to_peak_v": 2.0,
+            "rms_v": 0.707, "ac_rms_v": 0.707, "frequency_hz_estimate": 1000.0}
+  },
+  "preview": {"time_s": [0.0, "..."], "ch1": [0.0, "..."]},
+  "csv_path": "/path/to/captures/capture_20261023_130014_093954.csv"
 }
 ```
+Signals under 20 mV peak-to-peak are treated as flat and get no frequency estimate.
 
-### `connect_device`
-Connect to an Analog Discovery 2 device.
+**`measure_voltage(channel, samples=16)`** returns an averaged instantaneous reading for a scope channel.
 
-**Parameters**:
-- `device_name` (string, optional): Device name filter (None for first available, "Analog Discovery 2" for specific)
+### Waveform generator
 
-**Example**:
-```json
-{
-  "tool": "connect_device",
-  "arguments": {
-    "device_name": "Analog Discovery 2"
-  }
-}
-```
+**`generate_waveform(channel, function, frequency, amplitude, offset=0, symmetry=50, run_time_s=0, wait_s=0, repeat=0)`**
 
-### `disconnect_device`
-Disconnect from the current device.
+- `channel`: 1 (W1) or 2 (W2)
+- `function`: `sine`, `square`, `triangle`, `ramp_up`, `ramp_down`, `dc`, `noise`, `pulse`, `trapezium`, `sine_power`. For `dc` the level is `offset`.
+- `amplitude` + |`offset`| must stay within ±5 V; the tool refuses otherwise.
+- `symmetry`: duty cycle / skew in percent.
+- `run_time_s`, `wait_s`, `repeat`: burst control; zeros mean continuous.
 
-**Parameters**: None
+Output runs until **`stop_waveform(channel=0)`** (0 = all channels) or `disconnect_device`.
 
-### `get_device_info`
-Get information about the currently connected device.
+### Power supplies
 
-**Parameters**: None
+**`set_power_supplies(positive_volts?, negative_volts?, positive_enabled?, negative_enabled?, master_enabled=true)`** programs V+ (0.5 to 5 V) and V- (-5 to -0.5 V). Parameters left out are unchanged; out-of-range voltages are rejected rather than clamped. A rail outputs only when its own enable and the master switch are both on. The result reports setpoints (`enabled`, `voltage_setpoint_v`) and measured values (`active`, `voltage_v`, `current_a`).
 
-### `capture_waveform`
-Capture an analog waveform from a channel (oscilloscope function).
-
-**Parameters**:
-- `channel` (integer, required): Channel number (1 or 2)
-- `sampling_frequency` (number, optional): Sampling frequency in Hz (default: 20MHz)
-- `buffer_size` (integer, optional): Buffer size in samples (0 = maximum, default: 0)
-- `offset` (number, optional): Channel offset in volts (default: 0.0)
-- `amplitude_range` (number, optional): Channel range in volts (default: 5.0)
-
-**Example**:
-```json
-{
-  "tool": "capture_waveform",
-  "arguments": {
-    "channel": 1,
-    "sampling_frequency": 1000000,
-    "buffer_size": 4096,
-    "offset": 0.0,
-    "amplitude_range": 5.0
-  }
-}
-```
-
-### `generate_waveform`
-Generate a waveform on a channel (waveform generator function).
-
-**Parameters**:
-- `channel` (integer, required): Channel number (1 or 2)
-- `function` (string, required): Waveform type: "sine", "square", "triangle", "ramp_up", "ramp_down", "dc", "noise", "pulse", or "trapezium"
-- `frequency` (number, required): Frequency in Hz
-- `amplitude` (number, required): Amplitude in volts
-- `offset` (number, optional): DC offset in volts (default: 0.0)
-
-**Example**:
-```json
-{
-  "tool": "generate_waveform",
-  "arguments": {
-    "channel": 1,
-    "function": "sine",
-    "frequency": 1000,
-    "amplitude": 2.5,
-    "offset": 0.0
-  }
-}
-```
-
-### `stop_waveform`
-Stop waveform generation on a channel.
-
-**Parameters**:
-- `channel` (integer, required): Channel number (1 or 2)
-
-**Example**:
-```json
-{
-  "tool": "stop_waveform",
-  "arguments": {
-    "channel": 1
-  }
-}
-```
+**`disable_power_supplies`** turns both rails and the master switch off.
 
 ## Usage Examples
 
 ### Basic Workflow
 
-1. **List available devices**:
-   ```
-   list_devices
-   ```
+1. **See what is attached**: `list_devices`
+2. **Drive W1 with a 1 kHz, 2 Vpp sine**: `generate_waveform {"channel": 1, "function": "sine", "frequency": 1000, "amplitude": 1.0}`
+3. **Capture it on channel 1, triggered on the rising edge at 0 V**:
+   `capture_waveform {"channels": [1], "sampling_frequency": 1000000, "trigger_source": "ch1", "trigger_level": 0.0}`
+4. **Read the full record** from the `csv_path` in the result if the statistics and preview are not enough.
+5. **Power a circuit at 3.3 V**: `set_power_supplies {"positive_volts": 3.3, "positive_enabled": true}`
+6. **Check the DC level on channel 2**: `measure_voltage {"channel": 2}`
+7. **Shut everything down**: `disconnect_device`
 
-2. **Connect to device**:
-   ```
-   connect_device
-   ```
-   or with explicit device name:
-   ```
-   connect_device {"device_name": "Analog Discovery 2"}
-   ```
-
-3. **Capture a waveform**:
-   ```
-   capture_waveform {"channel": 1, "sampling_frequency": 20000000}
-   ```
-
-4. **Generate a sine wave**:
-   ```
-   generate_waveform {"channel": 1, "function": "sine", "frequency": 1000, "amplitude": 2.5}
-   ```
-
-5. **Stop waveform generation**:
-   ```
-   stop_waveform {"channel": 1}
-   ```
-
-6. **Disconnect**:
-   ```
-   disconnect_device
-   ```
+To use the 16k-sample scope buffer, call `connect_device {"configuration": 1}` first.
 
 ## Troubleshooting
 
@@ -290,7 +237,9 @@ This will test device connection, oscilloscope capture, and waveform generation.
 - **Packaging**: `pyproject.toml` + `uv.lock`, virtual environment managed by `uv`
 - **Python Library**: Uses `WF_SDK` wrapper from [Digilent's official WaveForms SDK Getting Started examples](https://github.com/Digilent/WaveForms-SDK-Getting-Started-PY)
 - **Device**: Digilent Analog Discovery 2
-- **Supported Functions**: Analog input (oscilloscope), analog output (waveform generator)
+- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor
+- **Layout**: `server.py` registers the tools; `ad2/` holds one module per instrument on top of `WF_SDK/`
+- **Local WF_SDK patches**: macOS framework path fallback, and skipping digital buffer queries in firmware configurations that have no digital channels (otherwise `connect_device` with configuration 1 or 2 fails)
 - **Note**: Channels are 1-indexed (1-2) as per WF_SDK convention
 
 ## License
@@ -299,15 +248,15 @@ This project is provided as-is for use with the Analog Discovery 2 device.
 
 ## Testing
 
-A test script is included to verify your installation:
+Unit tests run without a device. The WaveForms runtime must still be installed, because `WF_SDK` loads `libdwf` at import time; the device itself is replaced by a fake in `tests/conftest.py`.
 ```bash
-uv run test_device.py
+uv run pytest
 ```
-
-This will test:
-- Device connection
-- Oscilloscope waveform capture
-- Waveform generator
+With an Analog Discovery 2 attached, add the hardware smoke tests. They briefly enable the supplies and the generator with nothing connected to the device.
+```bash
+uv run pytest --hardware
+```
+`test_device.py` remains as a standalone check of the vendored WF_SDK wrapper.
 
 ## Resources
 

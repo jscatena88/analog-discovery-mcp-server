@@ -1,321 +1,224 @@
 #!/usr/bin/env python3
-"""
-MCP Server for Analog Discovery 2
-Provides tools to interact with Digilent Analog Discovery 2 device via MCP protocol.
-Uses the official WF_SDK wrapper from Digilent's WaveForms SDK Getting Started examples.
+"""MCP server for the Digilent Analog Discovery 2 (WaveForms SDK).
+
+Tools are thin wrappers over the ad2 package; every tool returns a JSON object and
+raises ToolError with an actionable message when the request cannot be fulfilled.
 """
 
-import json
 import sys
-from time import sleep
+from contextlib import contextmanager
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 try:
-    from WF_SDK import device, scope, wavegen, error
-except ImportError as e:
-    print(f"Error: WF_SDK not found. Please ensure WF_SDK is in the Python path.", file=sys.stderr)
+    from WF_SDK import device as wf_device
+except (ImportError, OSError) as e:
+    print("Error: WaveForms SDK (libdwf) or the WF_SDK package could not be loaded.", file=sys.stderr)
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
+from ad2 import analogio, analysis, export, scope, wavegen
+from ad2.errors import AD2Error
+from ad2.session import Session, enumerate_devices
 
-# Initialize the MCP server (official python SDK, stdio transport)
-mcp = MCPServer("Analog Discovery 2 MCP Server")
+INSTRUCTIONS = """\
+Digilent Analog Discovery 2 connected over USB.
 
+Instruments exposed:
+- Oscilloscope: 2 differential inputs (1+/1-, 2+/2-), 14-bit, up to 100 MS/s, 8192 samples per
+  capture in the default configuration (16384 with configuration 1). Tools: capture_waveform,
+  measure_voltage.
+- Waveform generator: outputs W1 and W2, ±5 V, up to 10 MHz. Tools: generate_waveform, stop_waveform.
+- Power supplies: V+ (0.5 to 5 V) and V- (-0.5 to -5 V). Tools: set_power_supplies,
+  disable_power_supplies. Readings in get_system_status.
+- USB voltage/current and board temperature: get_system_status.
+Digital pins DIO 0-15 are not exposed yet.
 
-class AnalogDiscoveryController:
-    """Controller for Analog Discovery 2 device operations using WF_SDK."""
-    
-    def __init__(self):
-        self.device_data = None
-        self.scope_initialized = False
-        self.wavegen_initialized = {}
-    
-    def connect(self, device_name: str = None, device_index: int = 0) -> dict:
-        """Connect to an Analog Discovery 2 device.
-        
-        Args:
-            device_name: Device name filter (None for first available, "Analog Discovery 2" for specific)
-            device_index: Not used with WF_SDK, kept for API compatibility
-        """
-        try:
-            if self.device_data is not None:
-                self.disconnect()
-            
-            # Open device (None = first available, or specific name)
-            device_filter = device_name if device_name else None
-            self.device_data = device.open(device_filter)
-            
-            info = {
-                "name": self.device_data.name,
-                "version": self.device_data.version,
-                "handle": self.device_data.handle.value if hasattr(self.device_data.handle, 'value') else str(self.device_data.handle),
-            }
-            
-            return {"success": True, "info": info}
-        except error as e:
-            return {"error": f"Failed to connect: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Failed to connect: {str(e)}"}
-    
-    def disconnect(self):
-        """Disconnect from the device."""
-        if self.device_data is not None:
-            try:
-                # Close instruments if initialized
-                if self.scope_initialized:
-                    scope.close(self.device_data)
-                    self.scope_initialized = False
-                
-                for channel in list(self.wavegen_initialized.keys()):
-                    wavegen.close(self.device_data, channel)
-                    del self.wavegen_initialized[channel]
-                
-                # Close device
-                device.close(self.device_data)
-            except:
-                pass
-            self.device_data = None
-    
-    def ensure_connected(self) -> tuple[bool, str]:
-        """Ensure device is connected, return (success, error_message)."""
-        if self.device_data is None:
-            result = self.connect()
-            if "error" in result:
-                return False, result["error"]
-        return True, ""
-    
-    def capture_waveform(
-        self,
-        channel: int,
-        sampling_frequency: float = 20e06,
-        buffer_size: int = 0,
-        offset: float = 0.0,
-        amplitude_range: float = 5.0
-    ) -> dict:
-        """Capture analog waveform from specified channel (oscilloscope function).
-        
-        Args:
-            channel: Channel number (1 or 2)
-            sampling_frequency: Sampling frequency in Hz (default: 20MHz)
-            buffer_size: Buffer size in samples (0 = maximum, default: 0)
-            offset: Channel offset in volts (default: 0.0)
-            amplitude_range: Channel range in volts (default: 5.0)
-        """
-        success, error_msg = self.ensure_connected()
-        if not success:
-            return {"error": error_msg}
-        
-        try:
-            if channel not in [1, 2]:
-                return {"error": "Channel must be 1 or 2 (WF_SDK uses 1-indexed channels)"}
-            
-            # Initialize scope if not already done
-            if not self.scope_initialized:
-                scope.open(self.device_data, sampling_frequency, buffer_size, offset, amplitude_range)
-                self.scope_initialized = True
-            
-            # Record data from the channel
-            buffer = scope.record(self.device_data, channel)
-            
-            # Get time axis
-            time_data = []
-            for index in range(len(buffer)):
-                time_data.append(index / scope.data.sampling_frequency)
-            
-            # Limit returned data size for preview (first 1000 points)
-            preview_size = min(1000, len(buffer))
-            
-            return {
-                "success": True,
-                "channel": channel,
-                "sampling_frequency": scope.data.sampling_frequency,
-                "samples": len(buffer),
-                "time_data": time_data[:preview_size],
-                "voltage_data": list(buffer[:preview_size]),
-                "full_data_points": len(buffer),
-            }
-        except error as e:
-            return {"error": f"Failed to capture analog: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Failed to capture analog: {str(e)}"}
-    
-    def generate_waveform(
-        self,
-        channel: int,
-        function: str,
-        frequency: float,
-        amplitude: float,
-        offset: float = 0.0
-    ) -> dict:
-        """Generate waveform on specified channel.
-        
-        Args:
-            channel: Channel number (1 or 2)
-            function: Waveform type: sine, square, triangle, ramp_up, ramp_down, dc, noise, pulse, trapezium
-            frequency: Frequency in Hz
-            amplitude: Amplitude in volts
-            offset: DC offset in volts (default: 0.0)
-        """
-        success, error_msg = self.ensure_connected()
-        if not success:
-            return {"error": error_msg}
-        
-        try:
-            if channel not in [1, 2]:
-                return {"error": "Channel must be 1 or 2 (WF_SDK uses 1-indexed channels)"}
-            
-            # Map function string to wavegen function constants
-            function_map = {
-                "sine": wavegen.function.sine,
-                "square": wavegen.function.square,
-                "triangle": wavegen.function.triangle,
-                "ramp_up": wavegen.function.ramp_up,
-                "ramp_down": wavegen.function.ramp_down,
-                "dc": wavegen.function.dc,
-                "noise": wavegen.function.noise,
-                "pulse": wavegen.function.pulse,
-                "trapezium": wavegen.function.trapezium,
-            }
-            
-            if function.lower() not in function_map:
-                return {"error": f"Function must be one of: {', '.join(function_map.keys())}"}
-            
-            func = function_map[function.lower()]
-            
-            # Generate waveform
-            wavegen.generate(
-                self.device_data,
-                channel=channel,
-                function=func,
-                offset=offset,
-                frequency=frequency,
-                amplitude=amplitude
-            )
-            
-            self.wavegen_initialized[channel] = True
-            
-            return {
-                "success": True,
-                "channel": channel,
-                "function": function,
-                "frequency": frequency,
-                "amplitude": amplitude,
-                "offset": offset,
-            }
-        except error as e:
-            return {"error": f"Failed to generate waveform: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Failed to generate waveform: {str(e)}"}
-    
-    def stop_waveform(self, channel: int) -> dict:
-        """Stop waveform generation on specified channel.
-        
-        Args:
-            channel: Channel number (1 or 2)
-        """
-        success, error_msg = self.ensure_connected()
-        if not success:
-            return {"error": error_msg}
-        
-        try:
-            if channel not in [1, 2]:
-                return {"error": "Channel must be 1 or 2 (WF_SDK uses 1-indexed channels)"}
-            
-            wavegen.close(self.device_data, channel)
-            if channel in self.wavegen_initialized:
-                del self.wavegen_initialized[channel]
-            
-            return {"success": True, "channel": channel, "status": "stopped"}
-        except error as e:
-            return {"error": f"Failed to stop waveform: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Failed to stop waveform: {str(e)}"}
+Workflow: tools auto-connect to the first device on first use; call connect_device only to pick a
+specific device or firmware configuration. capture_waveform returns summary statistics and a
+decimated preview and saves the full record to a CSV whose path is in the result; read that file
+for full-resolution data. Generator outputs and power supplies stay on until stopped or
+disconnect_device is called, which turns everything off. The WaveForms desktop application must
+not have the device open at the same time.
+"""
+
+mcp = MCPServer("Analog Discovery 2", instructions=INSTRUCTIONS)
+session = Session()
 
 
-# Global controller instance
-controller = AnalogDiscoveryController()
-
-
-@mcp.tool()
-def list_devices() -> str:
-    """List all available Analog Discovery 2 devices connected to the system."""
+@contextmanager
+def tool_errors():
+    """Translate instrument-layer failures into ToolError so the client sees the message."""
     try:
-        # WF_SDK doesn't have a direct list function, so we try to open the first device
-        # to check if any are available
-        try:
-            test_device = device.open()
-            device_count = 1  # At least one device found
-            device.close(test_device)
-            
-            return json.dumps({
-                "success": True,
-                "device_count": device_count,
-                "message": "At least one device found. Use connect_device to connect.",
-            }, indent=2)
-        except error as e:
-            if "no connected devices" in str(e).lower():
-                return json.dumps({
-                    "success": True,
-                    "device_count": 0,
-                    "devices": [],
-                }, indent=2)
-            raise
-    except Exception as e:
-        return json.dumps({"error": f"Failed to list devices: {str(e)}"}, indent=2)
+        yield
+    except AD2Error as e:
+        raise ToolError(str(e)) from e
+    except wf_device.error as e:
+        raise ToolError(f"WaveForms SDK error: {e}") from e
+
+
+# --------------------------------------------------------------------------- device
+
+@mcp.tool()
+def list_devices() -> dict[str, Any]:
+    """List Digilent devices visible to the WaveForms runtime, with serial numbers and the firmware
+    configurations each supports (scope/logic buffer sizes). Works without connecting. A device held
+    open by the WaveForms application is still listed but cannot be opened."""
+    with tool_errors():
+        devices = enumerate_devices()
+        return {"device_count": len(devices), "devices": devices}
 
 
 @mcp.tool()
-def connect_device(device_name: str = None) -> str:
-    """Connect to an Analog Discovery 2 device.
-    
+def connect_device(device_name: str | None = None, configuration: int = 0) -> dict[str, Any]:
+    """Open a device. Other tools auto-connect with defaults, so this is only needed to choose a
+    specific device or firmware configuration.
+
     Args:
-        device_name: Device name filter (None for first available, "Analog Discovery 2" for specific)
+        device_name: None for the first device, or e.g. "Analog Discovery 2".
+        configuration: Index from list_devices. For the AD2: 0 = default (8k scope buffer),
+            1 = 16k scope buffer, 3 = 16k logic analyzer/pattern buffers with a 512-sample scope.
     """
-    result = controller.connect(device_name)
-    return json.dumps(result, indent=2)
+    with tool_errors():
+        return session.connect(device_name, configuration)
 
 
 @mcp.tool()
-def disconnect_device() -> str:
-    """Disconnect from the current device."""
-    controller.disconnect()
-    return json.dumps({"success": True, "message": "Device disconnected"}, indent=2)
+def disconnect_device() -> dict[str, Any]:
+    """Stop the generator, turn off the power supplies, reset the scope and release the device."""
+    with tool_errors():
+        was_connected = session.connected
+        session.disconnect()
+        return {"disconnected": True, "was_connected": was_connected}
 
 
 @mcp.tool()
-def get_device_info() -> str:
-    """Get information about the currently connected device."""
-    if controller.device_data is None:
-        return json.dumps({"error": "No device connected. Use connect_device first."}, indent=2)
-    
-    info = {
-        "name": controller.device_data.name,
-        "version": controller.device_data.version,
-    }
-    return json.dumps({"success": True, "info": info}, indent=2)
+def get_device_info() -> dict[str, Any]:
+    """Capabilities of the connected device: channel counts, buffer sizes, voltage ranges, and
+    which instruments are currently active."""
+    with tool_errors():
+        return session.info()
 
+
+@mcp.tool()
+def get_system_status() -> dict[str, Any]:
+    """Board temperature, USB supply voltage and current, auxiliary input, and the state of the
+    V+ / V- power supplies."""
+    with tool_errors():
+        dd = session.ensure()
+        return {"monitor": analogio.system_monitor(dd), "supplies": analogio.supplies_status(dd)}
+
+
+# --------------------------------------------------------------------------- power supplies
+
+@mcp.tool()
+def set_power_supplies(
+    positive_volts: float | None = None,
+    negative_volts: float | None = None,
+    positive_enabled: bool | None = None,
+    negative_enabled: bool | None = None,
+    master_enabled: bool = True,
+) -> dict[str, Any]:
+    """Program the V+ and V- supplies. Parameters left as None are not changed. A rail outputs
+    only when both its own enable and master_enabled are true.
+
+    Args:
+        positive_volts: V+ setpoint, 0.5 to 5.0 V.
+        negative_volts: V- setpoint, -5.0 to -0.5 V (negative number).
+        positive_enabled: Turn V+ on or off.
+        negative_enabled: Turn V- on or off.
+        master_enabled: Master switch for both rails (default on).
+    """
+    with tool_errors():
+        dd = session.ensure()
+        return analogio.set_supplies(dd, positive_volts, negative_volts,
+                                     positive_enabled, negative_enabled, master_enabled)
+
+
+@mcp.tool()
+def disable_power_supplies() -> dict[str, Any]:
+    """Turn off V+ and V- and the master supply switch."""
+    with tool_errors():
+        return analogio.disable_supplies(session.ensure())
+
+
+# --------------------------------------------------------------------------- oscilloscope
 
 @mcp.tool()
 def capture_waveform(
-    channel: int,
-    sampling_frequency: float = 20e06,
+    channels: list[int] | None = None,
+    sampling_frequency: float = 20e6,
     buffer_size: int = 0,
-    offset: float = 0.0,
-    amplitude_range: float = 5.0
-) -> str:
-    """Capture analog waveform from a channel (oscilloscope function).
-    
-    Args:
-        channel: Channel number (1 or 2)
-        sampling_frequency: Sampling frequency in Hz (default: 20MHz)
-        buffer_size: Buffer size in samples (0 = maximum, default: 0)
-        offset: Channel offset in volts (default: 0.0)
-        amplitude_range: Channel range in volts (default: 5.0)
-    """
-    result = controller.capture_waveform(channel, sampling_frequency, buffer_size, offset, amplitude_range)
-    return json.dumps(result, indent=2)
+    range_volts: float = 5.0,
+    offset_volts: float = 0.0,
+    trigger_source: str = "none",
+    trigger_level: float = 0.0,
+    trigger_edge: str = "rising",
+    trigger_timeout_s: float = 1.0,
+    max_wait_s: float = 5.0,
+    preview_points: int = 200,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+) -> dict[str, Any]:
+    """Single-shot oscilloscope capture. Returns per-channel statistics (min, max, mean, Vpp, RMS,
+    estimated frequency), a decimated preview, and the path of a CSV holding every sample.
 
+    Args:
+        channels: Scope channels to read, e.g. [1] or [1, 2]. Default: all channels.
+        sampling_frequency: Sample rate in Hz (max 100e6). Capture length = buffer_size / rate.
+        buffer_size: Samples per channel; 0 = device maximum (8192 by default).
+        range_volts: Full-scale input range per channel (±range_volts). 5 V or 50 V on the AD2.
+        offset_volts: Input offset in volts.
+        trigger_source: none, ch1, ch2, wavegen1, wavegen2, external1..external4.
+        trigger_level: Trigger threshold in volts (analog sources).
+        trigger_edge: rising or falling.
+        trigger_timeout_s: Auto-trigger after this long without a trigger event (0 = never).
+        max_wait_s: Hard limit on how long the tool waits for the acquisition to finish.
+        preview_points: Number of decimated samples returned inline per channel.
+        save_csv: Write the full capture to disk.
+        csv_path: Where to write the CSV; default is a timestamped file under ./captures
+            (override the directory with the AD2_CAPTURE_DIR environment variable).
+    """
+    with tool_errors():
+        fs, data = scope.capture(session, channels, sampling_frequency, buffer_size, range_volts,
+                                 offset_volts, trigger_source, trigger_level, trigger_edge,
+                                 trigger_timeout_s, max_wait_s)
+        n = len(next(iter(data.values())))
+        preview = {"time_s": analysis.time_axis(n, fs, preview_points)}
+        channel_stats = {}
+        for ch, samples in data.items():
+            channel_stats[f"ch{ch}"] = analysis.summarize(samples, fs)
+            preview[f"ch{ch}"] = analysis.decimate(samples, preview_points)
+        path = export.write_capture_csv(csv_path, fs, data) if save_csv else None
+        return {
+            "sampling_frequency_hz": fs,
+            "samples_per_channel": n,
+            "duration_s": n / fs,
+            "range_volts": range_volts,
+            "offset_volts": offset_volts,
+            "trigger": {"source": trigger_source, "level_v": trigger_level, "edge": trigger_edge},
+            "channels": channel_stats,
+            "preview": preview,
+            "csv_path": path,
+        }
+
+
+@mcp.tool()
+def measure_voltage(channel: int, samples: int = 16) -> dict[str, Any]:
+    """Voltmeter: read the instantaneous voltage on a scope channel, averaged over several quick
+    samples. Use capture_waveform for anything time-varying.
+
+    Args:
+        channel: Scope channel, 1 or 2.
+        samples: Number of readings to average.
+    """
+    with tool_errors():
+        return scope.measure(session, channel, samples)
+
+
+# --------------------------------------------------------------------------- waveform generator
 
 @mcp.tool()
 def generate_waveform(
@@ -323,30 +226,37 @@ def generate_waveform(
     function: str,
     frequency: float,
     amplitude: float,
-    offset: float = 0.0
-) -> str:
-    """Generate waveform on a channel (waveform generator function).
-    
+    offset: float = 0.0,
+    symmetry: float = 50.0,
+    run_time_s: float = 0.0,
+    wait_s: float = 0.0,
+    repeat: int = 0,
+) -> dict[str, Any]:
+    """Start a waveform on W1 or W2. The output keeps running until stop_waveform or
+    disconnect_device.
+
     Args:
-        channel: Channel number (1 or 2)
-        function: Waveform type: sine, square, triangle, ramp_up, ramp_down, dc, noise, pulse, trapezium
-        frequency: Frequency in Hz
-        amplitude: Amplitude in volts
-        offset: DC offset in volts (default: 0.0)
+        channel: Generator channel, 1 (W1) or 2 (W2).
+        function: sine, square, triangle, ramp_up, ramp_down, dc, noise, pulse, trapezium, sine_power.
+            For dc, the level is set with offset and amplitude is ignored.
+        frequency: Frequency in Hz.
+        amplitude: Peak amplitude in volts; the output swings offset ± amplitude, within ±5 V.
+        offset: DC offset in volts.
+        symmetry: Duty cycle / symmetry in percent (square and pulse duty, triangle skew).
+        run_time_s: Run for this many seconds per burst; 0 = continuous.
+        wait_s: Delay before each burst starts, in seconds.
+        repeat: Number of bursts; 0 = repeat forever.
     """
-    result = controller.generate_waveform(channel, function, frequency, amplitude, offset)
-    return json.dumps(result, indent=2)
+    with tool_errors():
+        return wavegen.generate(session, channel, function, frequency, amplitude, offset,
+                                symmetry, run_time_s, wait_s, repeat)
 
 
 @mcp.tool()
-def stop_waveform(channel: int) -> str:
-    """Stop waveform generation on a channel.
-    
-    Args:
-        channel: Channel number (1 or 2)
-    """
-    result = controller.stop_waveform(channel)
-    return json.dumps(result, indent=2)
+def stop_waveform(channel: int = 0) -> dict[str, Any]:
+    """Stop generator output on one channel, or on all channels with channel=0."""
+    with tool_errors():
+        return wavegen.stop(session, channel)
 
 
 if __name__ == "__main__":

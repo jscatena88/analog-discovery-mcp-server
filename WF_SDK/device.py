@@ -459,19 +459,25 @@ def __get_info__(device_data):
     if dwf.FDwfDigitalInBitsInfo(device_data.handle, ctypes.byref(temp1)) == 0:
         check_error()
     device_data.digital.input.channel_count = temp1.value
-    # buffer size
-    if dwf.FDwfDigitalInBufferSizeInfo(device_data.handle, ctypes.byref(temp1)) == 0:
-        check_error()
-    device_data.digital.input.max_buffer_size = temp1.value
+    # buffer size (local patch: configurations without digital inputs reject this query)
+    if device_data.digital.input.channel_count > 0:
+        if dwf.FDwfDigitalInBufferSizeInfo(device_data.handle, ctypes.byref(temp1)) == 0:
+            check_error()
+        device_data.digital.input.max_buffer_size = temp1.value
+    else:
+        device_data.digital.input.max_buffer_size = 0
 
     # digital output information
     # channel count
     if dwf.FDwfDigitalOutCount(device_data.handle, ctypes.byref(temp1)) == 0:
         check_error()
     device_data.digital.output.channel_count = temp1.value
-    # buffer size
-    if dwf.FDwfDigitalOutDataInfo(device_data.handle, ctypes.c_int(0), ctypes.byref(temp1)) == 0:
-        check_error()
-    device_data.digital.output.max_buffer_size = temp1.value
+    # buffer size (local patch: configurations without digital outputs reject this query)
+    if device_data.digital.output.channel_count > 0:
+        if dwf.FDwfDigitalOutDataInfo(device_data.handle, ctypes.c_int(0), ctypes.byref(temp1)) == 0:
+            check_error()
+        device_data.digital.output.max_buffer_size = temp1.value
+    else:
+        device_data.digital.output.max_buffer_size = 0
 
     return device_data
