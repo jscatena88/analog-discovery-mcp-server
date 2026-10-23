@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "analog-discovery-2": {
+      "command": "uv",
+      "args": ["run", "server.py"]
+    }
+  }
+}

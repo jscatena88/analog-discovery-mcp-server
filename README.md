@@ -26,41 +26,66 @@ Before using this MCP server, you must install the WaveForms SDK from Digilent:
 
 ### 2. Python Requirements
 
-- Python 3.11 or later
-- pip package manager
+- Python 3.11 or later (`.python-version` pins 3.12; `uv` will download it if needed)
+- [uv](https://docs.astral.sh/uv/) for dependency and virtual environment management
 
 ## Installation
 
 1. Clone or download this repository:
 ```bash
-cd analog-discovery-msp-server
+cd analog-discovery-mcp-server
 ```
 
-2. Install Python dependencies:
+2. Create the virtual environment and install dependencies (this reads `pyproject.toml` and `uv.lock`):
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 3. Verify the installation:
 ```bash
-python server.py
+uv run server.py
 ```
-The server will start and wait for MCP client connections via stdio.
+The server will start and wait for MCP client connections via stdio. Press Ctrl+C to stop it.
+
+If you prefer not to use `uv`, a plain venv works too:
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install "mcp>=2.3,<3"
+```
 
 ## MCP Server Configuration
 
-To use this server with an MCP client (like Claude Desktop), add it to your MCP configuration file.
+The server speaks MCP over stdio. Every client below launches it with `uv run server.py`, which
+creates or updates the virtual environment automatically on first run.
+
+### For Claude Code
+
+The repository ships a project-scoped `.mcp.json`, so opening Claude Code inside this directory is enough.
+Claude Code asks once whether to trust the project's MCP servers; approve it and the tools appear.
+Check with:
+```bash
+claude mcp list
+```
+
+To make the server available from any directory instead, register it at user scope:
+```bash
+claude mcp add --scope user analog-discovery-2 -- uv run --directory /absolute/path/to/analog-discovery-mcp-server server.py
+```
+
+### For Cursor
+
+`.cursor/mcp.json` is included and uses the same `uv run` command.
 
 ### For Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
   "mcpServers": {
     "analog-discovery-2": {
-      "command": "python",
-      "args": ["/absolute/path/to/analog-discovery-msp-server/server.py"]
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/analog-discovery-mcp-server", "server.py"]
     }
   }
 }
@@ -68,9 +93,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### For Other MCP Clients
 
-The server uses FastMCP and communicates via stdio using the MCP protocol. Configure your client to run:
+Configure your client to run the following command with stdio transport:
 ```bash
-python /path/to/server.py
+uv run --directory /path/to/analog-discovery-mcp-server server.py
 ```
 
 ## Available Tools
@@ -235,14 +260,14 @@ sudo cp -R /Applications/WaveForms.app/Contents/Frameworks/dwf.framework /Librar
 ### "WF_SDK not found" or import errors
 - Ensure WaveForms SDK is installed (download from Digilent website)
 - Ensure `WF_SDK` folder is in the project directory (included in this repository)
-- The `PYTHONPATH` environment variable should include the project directory (set automatically in `.cursor/mcp.json`)
+- Launch the server with `uv run server.py` from the project directory, or pass `--directory`, so that `WF_SDK` is importable
 
-### "fastmcp package not found"
-- Install dependencies: `pip install -r requirements.txt`
+### "No module named 'mcp'"
+- Run `uv sync` in the project directory, then launch with `uv run server.py`
 
 ### Import errors
-- Verify Python version is 3.11 or later: `python --version`
-- Reinstall dependencies: `pip install -r requirements.txt --force-reinstall`
+- Verify Python version is 3.11 or later: `uv run python --version`
+- Recreate the environment: `rm -rf .venv && uv sync`
 
 ### Device connection issues
 - Make sure only one process is accessing the device at a time
@@ -253,15 +278,16 @@ sudo cp -R /Applications/WaveForms.app/Contents/Frameworks/dwf.framework /Librar
 ### Testing Installation
 Run the test script to verify everything is working:
 ```bash
-python3 test_device.py
+uv run test_device.py
 ```
 
 This will test device connection, oscilloscope capture, and waveform generation.
 
 ## Technical Details
 
-- **Framework**: FastMCP (Pythonic MCP server framework)
+- **Framework**: official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp` 2.x, `MCPServer` decorator API)
 - **Protocol**: MCP (Model Context Protocol) over stdio
+- **Packaging**: `pyproject.toml` + `uv.lock`, virtual environment managed by `uv`
 - **Python Library**: Uses `WF_SDK` wrapper from [Digilent's official WaveForms SDK Getting Started examples](https://github.com/Digilent/WaveForms-SDK-Getting-Started-PY)
 - **Device**: Digilent Analog Discovery 2
 - **Supported Functions**: Analog input (oscilloscope), analog output (waveform generator)
@@ -275,7 +301,7 @@ This project is provided as-is for use with the Analog Discovery 2 device.
 
 A test script is included to verify your installation:
 ```bash
-python3 test_device.py
+uv run test_device.py
 ```
 
 This will test:

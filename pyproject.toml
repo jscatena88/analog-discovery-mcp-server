@@ -1,0 +1,18 @@
+[project]
+name = "analog-discovery-mcp-server"
+version = "0.2.0"
+description = "MCP server for the Digilent Analog Discovery 2 via the WaveForms SDK"
+readme = "README.md"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false

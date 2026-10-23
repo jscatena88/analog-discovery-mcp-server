@@ -9,7 +9,7 @@ import json
 import sys
 from time import sleep
 
-from fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 try:
     from WF_SDK import device, scope, wavegen, error
@@ -19,8 +19,8 @@ except ImportError as e:
     sys.exit(1)
 
 
-# Initialize the FastMCP server
-mcp = FastMCP("Analog Discovery 2 MCP Server")
+# Initialize the MCP server (official python SDK, stdio transport)
+mcp = MCPServer("Analog Discovery 2 MCP Server")
 
 
 class AnalogDiscoveryController:

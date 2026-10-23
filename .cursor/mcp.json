@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "analog-discovery-2": {
-      "command": "python3",
-      "args": ["${workspaceFolder}/server.py"],
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}"
-      }
+      "command": "uv",
+      "args": ["run", "--directory", "${workspaceFolder}", "server.py"]
     }
   }
-} 
+}
