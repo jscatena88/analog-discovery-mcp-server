@@ -1,4 +1,9 @@
-"""SPI master on four DIO pins (full-duplex transfers, 1-8 bit words)."""
+"""SPI master on four DIO pins.
+
+Words of 1-8 bits go through the engine directly. 16-, 24- and 32-bit words are packed into
+bytes and sent as 8-bit words inside the same select assertion, which is bit-identical on the
+wire (the engine's own wide-word calls dropped data in loopback tests).
+"""
 
 import ctypes
 
@@ -10,6 +15,36 @@ from .digital import check_pins
 from .errors import AD2Error
 
 MAX_WORDS = 4096
+WIDE_WORDS = (16, 24, 32)
+
+
+def parse_words(data, bits_per_word: int, name: str = "write") -> list[int]:
+    """Words as a list of ints, or (for 8-bit words) any form parse_bytes accepts."""
+    if bits_per_word <= 8:
+        return list(parse_bytes(data, name))
+    if data is None:
+        return []
+    if isinstance(data, str):
+        raise AD2Error(f"{name} must be a list of integers when bits_per_word is {bits_per_word}")
+    limit = (1 << bits_per_word) - 1
+    words = []
+    for item in data:
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= limit:
+            raise AD2Error(f"{name} must contain integers between 0 and {limit} for {bits_per_word}-bit words, got {item!r}")
+        words.append(item)
+    return words
+
+
+def pack_words(words, bits_per_word: int, msb_first: bool) -> bytes:
+    size = bits_per_word // 8
+    order = "big" if msb_first else "little"
+    return b"".join(w.to_bytes(size, order) for w in words)
+
+
+def unpack_words(data: bytes, bits_per_word: int, msb_first: bool) -> list[int]:
+    size = bits_per_word // 8
+    order = "big" if msb_first else "little"
+    return [int.from_bytes(data[i:i + size], order) for i in range(0, len(data) - size + 1, size)]
 
 
 def _dwf():
@@ -61,35 +96,51 @@ def configure(session, clock_pin, mosi_pin, miso_pin, select_pin, frequency, mod
 def transfer(session, write, read_count, bits_per_word, fill_byte, clock_pin, mosi_pin, miso_pin,
              select_pin, frequency, mode, msb_first, select_active_low) -> dict:
     """Full-duplex transfer of max(len(write), read_count) words inside one select assertion."""
-    if not 1 <= bits_per_word <= 8:
-        raise AD2Error("bits_per_word must be between 1 and 8 (wider words are not supported yet)")
+    if not (1 <= bits_per_word <= 8 or bits_per_word in WIDE_WORDS):
+        raise AD2Error("bits_per_word must be between 1 and 8, or 16, 24 or 32")
     if not 0 <= fill_byte <= 255:
         raise AD2Error("fill_byte must be between 0 and 255")
     if read_count < 0:
         raise AD2Error("read_count must be zero or positive")
-    payload = parse_bytes(write, "write")
-    words = max(len(payload), read_count)
+    words_in = parse_words(write, bits_per_word)
+    words = max(len(words_in), read_count)
     if words == 0:
-        raise AD2Error("nothing to transfer: give bytes in write and/or a positive read_count")
-    if words > MAX_WORDS:
-        raise AD2Error(f"a single transfer is limited to {MAX_WORDS} words")
-    limit = (1 << bits_per_word) - 1
-    for value in list(payload) + [fill_byte]:
-        if value > limit:
-            raise AD2Error(f"value 0x{value:02x} does not fit in {bits_per_word}-bit words")
+        raise AD2Error("nothing to transfer: give data in write and/or a positive read_count")
+    wide = bits_per_word in WIDE_WORDS
+    bytes_per_word = bits_per_word // 8 if wide else 1
+    if words * bytes_per_word > MAX_WORDS:
+        raise AD2Error(f"a single transfer is limited to {MAX_WORDS} bytes on the wire")
+    if not wide:
+        limit = (1 << bits_per_word) - 1
+        for value in words_in + [fill_byte]:
+            if value > limit:
+                raise AD2Error(f"value 0x{value:02x} does not fit in {bits_per_word}-bit words")
     dd = configure(session, clock_pin, mosi_pin, miso_pin, select_pin, frequency, mode, msb_first,
                    select_active_low)
-    tx_bytes = payload + bytes([fill_byte]) * (words - len(payload))
-    tx = (ctypes.c_ubyte * words)(*tx_bytes)
-    rx = (ctypes.c_ubyte * words)()
-    if _dwf().FDwfDigitalSpiWriteRead(dd.handle, ctypes.c_int(1), ctypes.c_int(bits_per_word), tx,
-                                      ctypes.c_int(words), rx, ctypes.c_int(words)) == 0:
+    if wide:
+        fill_word = int.from_bytes(bytes([fill_byte]) * bytes_per_word, "big")
+        tx_words = words_in + [fill_word] * (words - len(words_in))
+        tx_bytes = pack_words(tx_words, bits_per_word, msb_first)
+        engine_bits = 8
+    else:
+        tx_bytes = bytes(words_in) + bytes([fill_byte]) * (words - len(words_in))
+        engine_bits = bits_per_word
+    count = len(tx_bytes)
+    tx = (ctypes.c_ubyte * count)(*tx_bytes)
+    rx = (ctypes.c_ubyte * count)()
+    if _dwf().FDwfDigitalSpiWriteRead(dd.handle, ctypes.c_int(1), ctypes.c_int(engine_bits), tx,
+                                      ctypes.c_int(count), rx, ctypes.c_int(count)) == 0:
         device.check_error()
-    return {
+    rx_bytes = bytes(rx)
+    result = {
         "words": words,
         "bits_per_word": bits_per_word,
         "written": format_bytes(tx_bytes),
-        "read": format_bytes(bytes(rx)),
+        "read": format_bytes(rx_bytes),
         "frequency_hz": frequency,
         "mode": mode,
     }
+    if wide:
+        result["written_words"] = tx_words
+        result["read_words"] = unpack_words(rx_bytes, bits_per_word, msb_first)
+    return result

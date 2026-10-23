@@ -305,12 +305,11 @@ sudo cp -R /Applications/WaveForms.app/Contents/Frameworks/dwf.framework /Librar
 - Restart your Mac if USB permissions seem stuck
 
 ### Testing Installation
-Run the test script to verify everything is working:
+Run the smoke script to exercise every instrument through the MCP tools:
 ```bash
-uv run test_device.py
+uv run smoke_test.py
 ```
-
-This will test device connection, oscilloscope capture, and waveform generation.
+Add `--jumpered` or `--analog-bench` when that wiring is in place, and `--diagnose` to check analog wiring with a DC step (it reports swapped +/- inputs and open capacitor paths).
 
 ## Technical Details
 
@@ -344,7 +343,7 @@ uv run pytest --hardware --jumpered       # DIO0->DIO8, DIO1->DIO9, DIO2->DIO10,
 uv run pytest --hardware --analog-bench   # W1->1+, 1- to GND, 0.22 uF from W1/1+ to 2+, 1 kOhm from 2+ to GND, 2- to GND
 ```
 The digital jumpers exercise UART, SPI, the I2C bus check and the external trigger; the analog bench is a 723 Hz high-pass that exercises the network and impedance analyzers, the spectrum tool and sweeps.
-`test_device.py` remains as a standalone check of the vendored WF_SDK wrapper.
+`uv run smoke_test.py` walks every instrument outside pytest and prints one line per check; it takes the same `--jumpered` and `--analog-bench` flags, plus `--diagnose` for the analog wiring check.
 
 ## Resources
 

@@ -97,13 +97,30 @@ def test_spi_read_pads_with_fill_byte(server, fake_dwf):
     assert len(fake_dwf.calls_to("FDwfDigitalSpiFrequencySet")) == 1   # settings reused
 
 
+def test_spi_wide_words_are_packed_into_bytes(server, fake_dwf):
+    out = call_tool(server, "spi_transfer", write=[0x1234, 0xBEEF], read_count=3, bits_per_word=16, fill_byte=0xFF)
+    assert out["written"]["hex"] == "12 34 be ef ff ff"
+    assert out["written_words"] == [0x1234, 0xBEEF, 0xFFFF]
+    assert out["read_words"] == [0x1234, 0xBEEF, 0xFFFF] and out["words"] == 3
+    (wr,) = fake_dwf.calls_to("FDwfDigitalSpiWriteRead")
+    assert wr[2].value == 8 and wr[4].value == 6                 # engine sees 6 eight-bit words
+    out = call_tool(server, "spi_transfer", write=[0x01020304], bits_per_word=32, msb_first=False)
+    assert out["written"]["hex"] == "04 03 02 01" and out["read_words"] == [0x01020304]
+    out = call_tool(server, "spi_transfer", write=[0xABCDEF], bits_per_word=24)
+    assert out["written"]["hex"] == "ab cd ef"
+    with pytest.raises(RuntimeError, match="between 0 and 65535"):
+        call_tool(server, "spi_transfer", write=[0x10000], bits_per_word=16)
+    with pytest.raises(RuntimeError, match="list of integers"):
+        call_tool(server, "spi_transfer", write="12 34", bits_per_word=16)
+
+
 def test_spi_rejects_bad_arguments(server, fake_dwf):
     with pytest.raises(RuntimeError, match="all be different"):
         call_tool(server, "spi_transfer", write=[1], clock_pin=1, mosi_pin=1)
     with pytest.raises(RuntimeError, match="does not fit in 4-bit"):
         call_tool(server, "spi_transfer", write=[0x1F], bits_per_word=4)
-    with pytest.raises(RuntimeError, match="between 1 and 8"):
-        call_tool(server, "spi_transfer", write=[1], bits_per_word=16)
+    with pytest.raises(RuntimeError, match="16, 24 or 32"):
+        call_tool(server, "spi_transfer", write=[1], bits_per_word=12)
     with pytest.raises(RuntimeError, match="nothing to transfer"):
         call_tool(server, "spi_transfer")
     with pytest.raises(RuntimeError, match="mode must be"):

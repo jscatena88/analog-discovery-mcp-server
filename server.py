@@ -25,37 +25,49 @@ from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
 INSTRUCTIONS = """\
-Digilent Analog Discovery 2 connected over USB.
+Digilent Analog Discovery 2 (USB test instrument). All tools return JSON; failures raise an
+error whose message says what to change.
 
-Instruments exposed:
-- Oscilloscope: 2 differential inputs (1+/1-, 2+/2-), 14-bit, up to 100 MS/s, 8192 samples per
-  capture in the default configuration (16384 with configuration 1). Tools: capture_waveform,
-  measure_voltage.
-- Waveform generator: outputs W1 and W2, ±5 V, up to 10 MHz. Tools: generate_waveform, stop_waveform.
-- Power supplies: V+ (0.5 to 5 V) and V- (-0.5 to -5 V). Tools: set_power_supplies,
-  disable_power_supplies. Readings in get_system_status.
-- USB voltage/current and board temperature: get_system_status.
-- Digital pins DIO 0-15 (3.3 V logic, 5 V tolerant), shared by three instruments:
-  static I/O (read_digital_pins, write_digital_pins), pattern generator (generate_pattern,
-  stop_pattern: clocks up to 50 MHz, pulses, custom bit streams) and logic analyzer
-  (capture_logic: 16 pins, up to 100 MS/s, 4096 samples by default, 16384 with configuration 3).
-  A pin driven by the pattern generator overrides its static level. The logic analyzer reads
-  back pins the device itself is driving, so loopback tests need no wiring.
-- Protocol engines on any DIO pins: UART (uart_send, uart_receive), SPI master (spi_transfer,
-  8-bit words), I2C master (i2c_scan, i2c_write, i2c_read, i2c_write_read) and I2C bus spy
-  (i2c_spy). I2C needs external pull-up resistors on SDA and SCL; the device has none.
-- Trigger inputs T1/T2 are usable as capture_waveform trigger_source external1/external2.
-- Analysis: capture_spectrum (FFT with peaks and THD), network_analyzer (Bode gain/phase of
-  channel 2 relative to channel 1 while W1 sweeps) and impedance_analyzer (R, X, C, L of a
-  device in series with a known reference resistor). Both analyzers drive W1 and take over
-  both scope channels. sweep_waveform produces a linear frequency sweep on W1 or W2.
+Connectors (flywire colours in the Digilent harness):
+- Scope inputs 1+/1- and 2+/2- (differential; tie the - input to GND for single-ended use).
+- Generator outputs W1, W2 (±5 V, 10 MHz max). Power supplies V+ (0.5..5 V), V- (-0.5..-5 V).
+- Digital pins DIO 0-15 (3.3 V logic, 5 V tolerant). Trigger pins T1/T2. Several GND pins.
 
-Workflow: tools auto-connect to the first device on first use; call connect_device only to pick a
-specific device or firmware configuration. capture_waveform and capture_logic return summary
-statistics and a compact preview and save the full record to a CSV whose path is in the result;
-read that file for full-resolution data. Generator, pattern and power-supply outputs stay on
-until stopped or disconnect_device is called, which turns everything off. The WaveForms desktop
-application must not have the device open at the same time.
+Tools by instrument:
+- Device: list_devices, connect_device (firmware configuration: 0 default, 1 = 16k scope buffer,
+  3 = 16k logic buffers), get_device_info, get_system_status (temperature, USB power, supply
+  state), disconnect_device (stops every output and releases the device).
+- Scope: capture_waveform (1-2 channels, edge trigger from ch1/ch2/wavegen1/wavegen2/external1-4,
+  8192 samples by default), measure_voltage (DC voltmeter), capture_spectrum (FFT, peaks, THD).
+- Generator: generate_waveform (standard shapes, custom samples, bursts, phase), sweep_waveform,
+  stop_waveform.
+- Supplies: set_power_supplies, disable_power_supplies.
+- Digital: read_digital_pins, write_digital_pins (static I/O), generate_pattern and stop_pattern
+  (clocks to 50 MHz, pulses, custom bit streams), capture_logic (16 pins, 100 MS/s, edge trigger).
+- Protocols on any DIO pins: uart_send, uart_receive, spi_transfer, i2c_scan, i2c_write, i2c_read,
+  i2c_write_read, i2c_spy.
+- Analyzers: network_analyzer (Bode: gain/phase of ch2 relative to ch1 while W1 sweeps) and
+  impedance_analyzer (R, X, C, L of a part in series with a known resistor).
+
+Conventions: frequencies in Hz, voltages in V, times in s. Scope and generator channels are 1-based
+(1, 2); DIO pins are 0-based (0-15). I2C addresses are 7-bit, not pre-shifted. Byte data may be
+given as hex strings ("01 ab ff") or lists of ints.
+
+Workflow:
+- Tools auto-connect to the first device; call connect_device only to pick a device or configuration.
+- Captures return statistics plus a decimated preview and write every sample to a CSV whose path is
+  in the result (default ./captures); read that file when full resolution matters. Pick
+  sampling_frequency so the record (buffer_size / rate) spans several periods of the signal.
+- Outputs (generator, pattern, supplies) stay on until stopped; disconnect_device turns all off.
+- To verify analog wiring, drive W1 with function "dc" and read the channel means with
+  capture_waveform: a swapped +/- pair reads the opposite sign.
+- Trigger waits are bounded by max_wait_s; a timeout error means no edge was seen, not a crash.
+
+Caveats: the DIO pins are shared, and a pin driven by the pattern generator overrides its static
+level; the logic analyzer reads back pins the device itself drives, so loopback needs no wiring.
+Both analyzers drive W1 and take over both scope channels while running. I2C needs external
+pull-ups on SDA and SCL. Supply readings settle a few hundred ms after a change. The WaveForms
+desktop application must not have the device open at the same time.
 """
 
 mcp = MCPServer("Analog Discovery 2", instructions=INSTRUCTIONS)
@@ -602,19 +614,18 @@ def spi_transfer(
     fill_byte: int = 0,
 ) -> dict[str, Any]:
     """SPI master full-duplex transfer: select asserted, max(len(write), read_count) words clocked
-    out while the same number are read back, select released. Words wider than 8 bits are not
-    supported yet.
+    out while the same number are read back, select released.
 
     Args:
-        write: Bytes to send as hex ("9f 00 00") or a list of ints; padded with fill_byte when
-            read_count is larger.
+        write: Words to send. For 8-bit (or narrower) words: hex ("9f 00 00") or a list of ints.
+            For 16/24/32-bit words: a list of ints. Padded with fill_byte when read_count is larger.
         read_count: Minimum number of words to clock (and read back).
         clock_pin, mosi_pin, miso_pin, select_pin: DIO pin assignments.
         frequency: SCK frequency in Hz.
         mode: SPI mode 0-3 (CPOL/CPHA).
-        msb_first: Bit order.
-        bits_per_word: 1 to 8.
-        fill_byte: Value sent while only reading.
+        msb_first: Bit order (for wide words also the byte order on the wire).
+        bits_per_word: 1 to 8, or 16, 24, 32. Wide words are returned in read_words.
+        fill_byte: Byte value sent while only reading.
     """
     with tool_errors():
         return spi.transfer(session, write, read_count, bits_per_word, fill_byte, clock_pin, mosi_pin,

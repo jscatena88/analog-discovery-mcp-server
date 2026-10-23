@@ -133,6 +133,12 @@ def test_spi_loopback(hw):
     out = call_tool(hw, "spi_transfer", write=list(range(256)), read_count=300, clock_pin=1, mosi_pin=0,
                     miso_pin=8, select_pin=2, frequency=5e6, fill_byte=0x5A)
     assert out["read"]["bytes"] == list(range(256)) + [0x5A] * 44
+    out = call_tool(hw, "spi_transfer", write=[0x1234, 0xBEEF, 0x0F0F, 0x8001], bits_per_word=16, clock_pin=1,
+                    mosi_pin=0, miso_pin=8, select_pin=2, frequency=1e6)
+    assert out["read_words"] == [0x1234, 0xBEEF, 0x0F0F, 0x8001]
+    out = call_tool(hw, "spi_transfer", write=[0x12345678, 0xDEADBEEF], bits_per_word=32, clock_pin=1,
+                    mosi_pin=0, miso_pin=8, select_pin=2, frequency=1e6)
+    assert out["read_words"] == [0x12345678, 0xDEADBEEF]
 
 
 @jumpered
