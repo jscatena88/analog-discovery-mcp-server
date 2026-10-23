@@ -16,6 +16,10 @@ An MCP (Model Context Protocol) server for controlling the Digilent Analog Disco
 - **SPI master**: full-duplex transfers on any four DIO pins, modes 0-3, 1-8 bit words
 - **I2C master and spy**: address scan, write, read, write-then-read, and passive bus decoding (external pull-ups required)
 - **External triggers**: T1/T2 usable as scope trigger sources
+- **Spectrum analyzer**: FFT of a capture with peaks, harmonics, THD and noise floor
+- **Network analyzer**: Bode gain/phase sweeps with -3 dB cutoff and response classification
+- **Impedance analyzer**: |Z|, phase, R, X, C and L of a component against a reference resistor
+- **Generator extras**: custom sample data, phase offset, phase-aligned start of both channels, linear frequency sweeps
 - **Device management**: enumeration with serial numbers and firmware configurations, explicit configuration selection (for example the 16k-sample scope buffer), auto-connect on first use, and a disconnect that turns every output off
 - **Hardware-free tests**: a fake `libdwf` lets the whole tool surface run under pytest without a device
 
@@ -228,6 +232,20 @@ The protocol engines run on any DIO pins; pick pins that are not in use by the p
 
 The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wiring hint instead of returning garbage.
 
+### Analysis (spectrum, network and impedance analyzers)
+
+**`capture_spectrum(channel=1, sampling_frequency=1e6, buffer_size=0, range_volts=5, offset_volts=0, window="hann", max_peaks=10, preview_points=200, save_csv=true, csv_path?)`** takes one capture and returns the strongest peaks (frequency, volts peak, dBV), the fundamental's harmonics with THD, the noise floor, a max-hold preview and a CSV of every bin. Use `flattop` for the most accurate amplitudes. Resolution is `sampling_frequency / buffer_size`, and the spectrum reaches half the sample rate.
+
+**`network_analyzer(start_frequency=100, stop_frequency=1e6, steps=31, amplitude=1, offset=0, log_scale=true, min_periods=16, max_wait_s=5, save_csv=true, csv_path?)`** sweeps W1 and measures the gain (dB) and phase (degrees) of channel 2 relative to channel 1. Wire W1 and 1+ to the circuit input, 2+ to its output, 1- and 2- to ground. The summary lists the -3 dB cutoff(s) and classifies the response (low_pass, high_pass, band_pass, flat, ...). Low start frequencies take longer, about `min_periods / f` per point.
+
+**`impedance_analyzer(start_frequency=100, stop_frequency=1e6, steps=21, reference_ohm=1e3, mode="series_reference", amplitude=1, ...)`** measures a component through a known reference resistor. For `series_reference`: W1 and 1+ to one end of the device, the other end to 2+ and to the resistor, resistor to ground, 1- and 2- to ground. Each point gives |Z|, phase, R, X, series/parallel C and L, dissipation and Q; the summary classifies the device as capacitive, inductive or resistive with its median value. Pick `reference_ohm` near the expected |Z|.
+
+Both analyzers take over W1 and both scope channels while they run.
+
+**`sweep_waveform(channel, start_frequency, stop_frequency, sweep_time_s=1, amplitude=1, offset=0, function="sine", repeat=0)`** produces a linear frequency sweep on W1 or W2. Trigger a capture on `wavegen1`/`wavegen2` to catch the start of a sweep.
+
+`generate_waveform` also accepts `function="custom"` with `data` (one period as samples in -1..1, up to 4096, played at `frequency * len(data)` samples per second), `phase_deg`, and `start_all_channels=true` to restart W1 and W2 together so their phases line up.
+
 ## Usage Examples
 
 ### Basic Workflow
@@ -244,7 +262,10 @@ The AD2 has no I2C pull-ups. If SDA or SCL is held low the tools fail with a wir
 9. **Talk to a serial console on DIO 4/5 at 115200**: `uart_send {"data": "help\r\n", "tx_pin": 4, "rx_pin": 5, "baud_rate": 115200}`
 10. **Read a SPI flash ID** (CS DIO0, SCK DIO1, MOSI DIO2, MISO DIO3): `spi_transfer {"write": "9f", "read_count": 4}`
 11. **Find I2C devices and read a register**: `i2c_scan {}` then `i2c_write_read {"address": 104, "data": "75", "count": 1}`
-12. **Shut everything down**: `disconnect_device`
+12. **Bode plot of a filter between W1/1+ and 2+**: `network_analyzer {"start_frequency": 20, "stop_frequency": 100000, "steps": 41}`
+13. **Measure a capacitor against a 1 kΩ reference**: `impedance_analyzer {"start_frequency": 200, "stop_frequency": 20000, "reference_ohm": 1000}`
+14. **Check a signal's harmonics**: `capture_spectrum {"channel": 1, "sampling_frequency": 200000, "window": "flattop"}`
+15. **Shut everything down**: `disconnect_device`
 
 To use the 16k-sample scope buffer, call `connect_device {"configuration": 1}` first.
 
@@ -298,7 +319,7 @@ This will test device connection, oscilloscope capture, and waveform generation.
 - **Packaging**: `pyproject.toml` + `uv.lock`, virtual environment managed by `uv`
 - **Python Library**: Uses `WF_SDK` wrapper from [Digilent's official WaveForms SDK Getting Started examples](https://github.com/Digilent/WaveForms-SDK-Getting-Started-PY)
 - **Device**: Digilent Analog Discovery 2
-- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor, static digital I/O, pattern generator, logic analyzer, UART, SPI master, I2C master and spy
+- **Supported Functions**: oscilloscope, voltmeter, waveform generator, power supplies, system monitor, static digital I/O, pattern generator, logic analyzer, UART, SPI master, I2C master and spy, spectrum / network / impedance analyzers, generator sweeps and custom data
 - **Layout**: `server.py` registers the tools; `ad2/` holds one module per instrument on top of `WF_SDK/`
 - **Local WF_SDK patches**: macOS framework path fallback, and skipping digital buffer queries in firmware configurations that have no digital channels (otherwise `connect_device` with configuration 1 or 2 fails)
 - **Note**: Channels are 1-indexed (1-2) as per WF_SDK convention
@@ -317,10 +338,12 @@ With an Analog Discovery 2 attached, add the hardware smoke tests. They briefly 
 ```bash
 uv run pytest --hardware
 ```
-The protocol and external-trigger tests additionally need loopback jumpers (DIO0 to DIO8, DIO1 to DIO9, DIO2 to DIO10, and T1 to DIO15):
+Two groups of hardware tests need bench wiring and are enabled separately:
 ```bash
-uv run pytest --hardware --jumpered
+uv run pytest --hardware --jumpered       # DIO0->DIO8, DIO1->DIO9, DIO2->DIO10, T1->DIO15
+uv run pytest --hardware --analog-bench   # W1->1+, 1- to GND, 0.22 uF from W1/1+ to 2+, 1 kOhm from 2+ to GND, 2- to GND
 ```
+The digital jumpers exercise UART, SPI, the I2C bus check and the external trigger; the analog bench is a 723 Hz high-pass that exercises the network and impedance analyzers, the spectrum tool and sweeps.
 `test_device.py` remains as a standalone check of the vendored WF_SDK wrapper.
 
 ## Resources

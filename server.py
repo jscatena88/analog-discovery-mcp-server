@@ -19,7 +19,8 @@ except (ImportError, OSError) as e:
     print(f"Details: {e}", file=sys.stderr)
     sys.exit(1)
 
-from ad2 import analogio, analysis, bytesutil, digital, export, i2c, logic, pattern, scope, spi, uart, wavegen
+from ad2 import (analogio, analysis, analyzer, bytesutil, digital, export, i2c, logic, pattern, scope,
+                 spectrum, spi, uart, wavegen)
 from ad2.errors import AD2Error
 from ad2.session import Session, enumerate_devices
 
@@ -44,6 +45,10 @@ Instruments exposed:
   8-bit words), I2C master (i2c_scan, i2c_write, i2c_read, i2c_write_read) and I2C bus spy
   (i2c_spy). I2C needs external pull-up resistors on SDA and SCL; the device has none.
 - Trigger inputs T1/T2 are usable as capture_waveform trigger_source external1/external2.
+- Analysis: capture_spectrum (FFT with peaks and THD), network_analyzer (Bode gain/phase of
+  channel 2 relative to channel 1 while W1 sweeps) and impedance_analyzer (R, X, C, L of a
+  device in series with a known reference resistor). Both analyzers drive W1 and take over
+  both scope channels. sweep_waveform produces a linear frequency sweep on W1 or W2.
 
 Workflow: tools auto-connect to the first device on first use; call connect_device only to pick a
 specific device or firmware configuration. capture_waveform and capture_logic return summary
@@ -215,6 +220,41 @@ def capture_waveform(
 
 
 @mcp.tool()
+def capture_spectrum(
+    channel: int = 1,
+    sampling_frequency: float = 1e6,
+    buffer_size: int = 0,
+    range_volts: float = 5.0,
+    offset_volts: float = 0.0,
+    window: str = "hann",
+    max_peaks: int = 10,
+    preview_points: int = 200,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+) -> dict[str, Any]:
+    """FFT of one scope capture. Returns the strongest peaks (frequency, volts, dBV), the
+    fundamental's harmonics and THD, the noise floor, a max-hold preview and a CSV of every bin.
+    Frequency resolution = sampling_frequency / buffer_size; the spectrum spans up to half the
+    sample rate, so pick sampling_frequency a few times above the highest frequency of interest.
+
+    Args:
+        channel: Scope channel, 1 or 2.
+        sampling_frequency: Sample rate in Hz (max 100e6).
+        buffer_size: Samples; 0 = maximum (8192, or 16384 with configuration 1).
+        range_volts, offset_volts: Input range and offset.
+        window: hann (default), blackman, flattop (best amplitude accuracy) or rectangular.
+        max_peaks: Peaks to list.
+        preview_points: Max-hold decimated points returned inline.
+        save_csv, csv_path: Full spectrum export.
+    """
+    with tool_errors():
+        fs, data = scope.capture(session, [channel], sampling_frequency, buffer_size, range_volts, offset_volts)
+        result = spectrum.analyze(data[channel], fs, window, max_peaks, preview_points, csv_path, save_csv)
+        result["channel"] = channel
+        return result
+
+
+@mcp.tool()
 def measure_voltage(channel: int, samples: int = 16) -> dict[str, Any]:
     """Voltmeter: read the instantaneous voltage on a scope channel, averaged over several quick
     samples. Use capture_waveform for anything time-varying.
@@ -240,25 +280,53 @@ def generate_waveform(
     run_time_s: float = 0.0,
     wait_s: float = 0.0,
     repeat: int = 0,
+    data: list[float] | None = None,
+    phase_deg: float = 0.0,
+    start_all_channels: bool = False,
 ) -> dict[str, Any]:
     """Start a waveform on W1 or W2. The output keeps running until stop_waveform or
     disconnect_device.
 
     Args:
         channel: Generator channel, 1 (W1) or 2 (W2).
-        function: sine, square, triangle, ramp_up, ramp_down, dc, noise, pulse, trapezium, sine_power.
-            For dc, the level is set with offset and amplitude is ignored.
-        frequency: Frequency in Hz.
+        function: sine, square, triangle, ramp_up, ramp_down, dc, noise, pulse, trapezium,
+            sine_power, or custom (one period given by data). For dc, the level is offset.
+        frequency: Frequency in Hz (for custom: repetitions of the data per second).
         amplitude: Peak amplitude in volts; the output swings offset ± amplitude, within ±5 V.
         offset: DC offset in volts.
         symmetry: Duty cycle / symmetry in percent (square and pulse duty, triangle skew).
         run_time_s: Run for this many seconds per burst; 0 = continuous.
         wait_s: Delay before each burst starts, in seconds.
         repeat: Number of bursts; 0 = repeat forever.
+        data: For custom: one period as samples between -1 and 1 (up to 4096), played at
+            frequency * len(data) samples per second.
+        phase_deg: Phase offset of the carrier in degrees (relative to the other channel when
+            started together).
+        start_all_channels: Restart every configured generator channel together so W1 and W2
+            are phase-aligned.
     """
     with tool_errors():
         return wavegen.generate(session, channel, function, frequency, amplitude, offset,
-                                symmetry, run_time_s, wait_s, repeat)
+                                symmetry, run_time_s, wait_s, repeat, data, phase_deg, start_all_channels)
+
+
+@mcp.tool()
+def sweep_waveform(
+    channel: int,
+    start_frequency: float,
+    stop_frequency: float,
+    sweep_time_s: float = 1.0,
+    amplitude: float = 1.0,
+    offset: float = 0.0,
+    function: str = "sine",
+    repeat: int = 0,
+) -> dict[str, Any]:
+    """Linear frequency sweep on W1 or W2 from start_frequency to stop_frequency over sweep_time_s,
+    repeating until stop_waveform (or `repeat` times). Use capture_waveform with
+    trigger_source wavegen1/wavegen2 to catch the start of a sweep."""
+    with tool_errors():
+        return wavegen.sweep(session, channel, start_frequency, stop_frequency, sweep_time_s, amplitude,
+                             offset, function, repeat)
 
 
 @mcp.tool()
@@ -266,6 +334,70 @@ def stop_waveform(channel: int = 0) -> dict[str, Any]:
     """Stop generator output on one channel, or on all channels with channel=0."""
     with tool_errors():
         return wavegen.stop(session, channel)
+
+
+# --------------------------------------------------------------------------- analyzers
+
+@mcp.tool()
+def network_analyzer(
+    start_frequency: float = 100.0,
+    stop_frequency: float = 1e6,
+    steps: int = 31,
+    amplitude: float = 1.0,
+    offset: float = 0.0,
+    log_scale: bool = True,
+    min_periods: int = 16,
+    max_wait_s: float = 5.0,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+) -> dict[str, Any]:
+    """Bode plot: sweep W1 and measure the gain (dB) and phase (degrees) of scope channel 2
+    relative to channel 1 at each frequency. Wire W1 and 1+ to the circuit input, 2+ to its
+    output, 1- and 2- to ground. The summary gives the -3 dB cutoff(s) and the response type.
+    Takes over W1 and both scope channels; low start frequencies take longer (min_periods / f).
+
+    Args:
+        start_frequency, stop_frequency: Sweep range in Hz.
+        steps: Number of frequency points.
+        amplitude: Stimulus amplitude in volts.
+        offset: Stimulus DC offset in volts.
+        log_scale: Logarithmic (true) or linear spacing.
+        min_periods: Periods averaged per point.
+        max_wait_s: Extra time allowed per point beyond min_periods / f.
+        save_csv, csv_path: Export of all points.
+    """
+    with tool_errors():
+        return analyzer.bode(session, start_frequency, stop_frequency, steps, amplitude, offset, log_scale,
+                             min_periods, max_wait_s, csv_path, save_csv)
+
+
+@mcp.tool()
+def impedance_analyzer(
+    start_frequency: float = 100.0,
+    stop_frequency: float = 1e6,
+    steps: int = 21,
+    reference_ohm: float = 1e3,
+    mode: str = "series_reference",
+    amplitude: float = 1.0,
+    offset: float = 0.0,
+    log_scale: bool = True,
+    min_periods: int = 16,
+    max_wait_s: float = 5.0,
+    save_csv: bool = True,
+    csv_path: str | None = None,
+) -> dict[str, Any]:
+    """Measure a component's impedance across frequency using a known reference resistor:
+    |Z|, phase, R, X, series/parallel C and L, dissipation and Q per point, plus a summary that
+    classifies the device (capacitive / inductive / resistive) with its median value.
+
+    Wiring for mode series_reference: W1 and 1+ to one end of the device, the other end to 2+
+    and to the reference resistor, resistor's other end to ground, 1- and 2- to ground.
+    Mode shunt_reference swaps the resistor and the device. Choose reference_ohm close to the
+    expected |Z| in the frequency range of interest.
+    """
+    with tool_errors():
+        return analyzer.impedance(session, start_frequency, stop_frequency, steps, reference_ohm, mode,
+                                 amplitude, offset, log_scale, min_periods, max_wait_s, csv_path, save_csv)
 
 
 # --------------------------------------------------------------------------- static digital I/O

@@ -1,8 +1,10 @@
 """Smoke tests against a real Analog Discovery 2. Run with: uv run pytest --hardware
 
-Most tests need nothing wired. The protocol and external-trigger tests (marked `jumpered`)
-expect these jumpers: DIO0->DIO8, DIO1->DIO9, DIO2->DIO10 and T1->DIO15; run them with
-`uv run pytest --hardware --jumpered`.
+Most tests need nothing wired. Two groups need bench wiring and their own flag:
+- `jumpered` (--jumpered): DIO0->DIO8, DIO1->DIO9, DIO2->DIO10, T1->DIO15
+- `analog_bench` (--analog-bench): W1 to 1+, 1- to GND; 0.22 uF from the W1/1+ node to 2+;
+  1 kOhm from 2+ to GND; 2- to GND (a 723 Hz high-pass for the network analyzer, and the
+  capacitor as the impedance analyzer's device under test)
 """
 
 import os
@@ -155,6 +157,60 @@ def test_external_trigger_from_t1(hw):
         call_tool(hw, "capture_waveform", channels=[1], trigger_source="external1", trigger_timeout_s=0,
                   max_wait_s=0.5, save_csv=False)
     call_tool(hw, "write_digital_pins", inputs=[15])
+
+
+analog_bench = pytest.mark.analog_bench
+
+
+@analog_bench
+def test_network_analyzer_rc_high_pass(hw):
+    out = call_tool(hw, "network_analyzer", start_frequency=20, stop_frequency=100e3, steps=25, min_periods=8)
+    summary = out["summary"]
+    assert summary["response"] == "high_pass"
+    (cutoff,) = summary["cutoff_hz_minus3db"]
+    assert 400 < cutoff < 1100                                  # 723 Hz nominal, capacitor tolerance
+    assert abs(out["points"][-1]["gain_db"]) < 1 and abs(out["points"][-1]["phase_deg"]) < 10
+    assert out["points"][0]["gain_db"] < -15 and 70 < out["points"][0]["phase_deg"] < 95
+    assert all(p["warnings"] == [] for p in out["points"])
+    assert os.path.exists(out["csv_path"])
+
+
+@analog_bench
+def test_impedance_analyzer_capacitor(hw):
+    out = call_tool(hw, "impedance_analyzer", start_frequency=200, stop_frequency=20e3, steps=11,
+                    reference_ohm=1e3, min_periods=8)
+    summary = out["summary"]
+    assert summary["dut_type"] == "capacitive"
+    assert 0.15e-6 < summary["series_capacitance_f"] < 0.5e-6
+    mid = out["points"][5]
+    assert mid["reactance_ohm"] < 0 and -95 < mid["phase_deg"] < -60
+
+
+@analog_bench
+def test_spectrum_of_generator_sine(hw):
+    call_tool(hw, "generate_waveform", channel=1, function="sine", frequency=1e3, amplitude=1.0)
+    out = call_tool(hw, "capture_spectrum", channel=1, sampling_frequency=200e3, window="flattop", max_peaks=5)
+    assert abs(out["fundamental"]["frequency_hz"] - 1e3) < 2 * out["resolution_hz"]
+    assert 0.95 < out["fundamental"]["amplitude_v"] < 1.05
+    assert out["thd_percent"] < 2
+    assert out["noise_floor_dbv"] < -60
+    call_tool(hw, "stop_waveform")
+
+
+@analog_bench
+def test_sweep_waveform_start_and_end_frequency(hw):
+    call_tool(hw, "sweep_waveform", channel=1, start_frequency=1e3, stop_frequency=9e3, sweep_time_s=0.1, amplitude=1.0)
+    out = call_tool(hw, "capture_waveform", channels=[1], sampling_frequency=100e3, trigger_source="wavegen1",
+                    trigger_timeout_s=0, max_wait_s=2.0, preview_points=0, save_csv=False)
+    samples = out["preview"]["ch1"]                               # preview_points=0 returns every sample
+    fs = out["sampling_frequency_hz"]
+    from ad2.analysis import estimate_frequency
+    n = len(samples)
+    first = estimate_frequency(samples[: n // 10], fs)              # first 8 ms of the 100 ms sweep
+    last = estimate_frequency(samples[-n // 10:], fs)               # 74-82 ms into the sweep
+    assert 900 < first < 2200, first
+    assert 6000 < last < 9000, last
+    call_tool(hw, "stop_waveform")
 
 
 def test_wavegen_trigger_source(hw):

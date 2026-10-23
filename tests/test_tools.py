@@ -16,6 +16,7 @@ def test_tool_list_is_complete(server):
         "generate_waveform", "stop_waveform", "read_digital_pins", "write_digital_pins",
         "generate_pattern", "stop_pattern", "capture_logic", "uart_send", "uart_receive",
         "spi_transfer", "i2c_scan", "i2c_write", "i2c_read", "i2c_write_read", "i2c_spy",
+        "capture_spectrum", "network_analyzer", "impedance_analyzer", "sweep_waveform",
     }
 
 

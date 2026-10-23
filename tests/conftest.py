@@ -22,21 +22,27 @@ def pytest_addoption(parser):
                      help="run tests that need a connected Analog Discovery 2")
     parser.addoption("--jumpered", action="store_true", default=False,
                      help="also run hardware tests that need jumpers DIO0->8, DIO1->9, DIO2->10, T1->DIO15")
+    parser.addoption("--analog-bench", action="store_true", default=False,
+                     help="also run hardware tests that need W1->1+ and the RC circuit on 2+ (see test_hardware.py)")
 
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "hardware: needs a connected Analog Discovery 2")
-    config.addinivalue_line("markers", "jumpered: needs loopback jumpers on the device")
+    config.addinivalue_line("markers", "jumpered: needs digital loopback jumpers on the device")
+    config.addinivalue_line("markers", "analog_bench: needs the W1 / RC analog bench wiring")
 
 
 def pytest_collection_modifyitems(config, items):
     skip_hw = pytest.mark.skip(reason="needs --hardware and a connected Analog Discovery 2")
-    skip_jumper = pytest.mark.skip(reason="needs --jumpered and loopback jumpers (see test_hardware.py)")
+    skip_jumper = pytest.mark.skip(reason="needs --jumpered and digital loopback jumpers (see test_hardware.py)")
+    skip_analog = pytest.mark.skip(reason="needs --analog-bench and the W1 / RC wiring (see test_hardware.py)")
     for item in items:
         if "hardware" in item.keywords and not config.getoption("--hardware"):
             item.add_marker(skip_hw)
         elif "jumpered" in item.keywords and not config.getoption("--jumpered"):
             item.add_marker(skip_jumper)
+        elif "analog_bench" in item.keywords and not config.getoption("--analog-bench"):
+            item.add_marker(skip_analog)
 
 
 def _fill(buf, text):
@@ -86,6 +92,12 @@ class FakeDwf:
         self.i2c_devices = {0x1D: bytearray(range(16))}
         self.i2c_writes = []
         self.i2c_spy_fragments = []     # (start, stop, bytes, nak) tuples handed out in order
+        # analyzer engine: a 1 k / 0.22 uF high-pass as the transfer function, the capacitor
+        # (with 5 ohm ESR) as the impedance device under test
+        self.analyzer_r = 1e3
+        self.analyzer_c = 0.22e-6
+        self.analyzer_esr = 5.0
+        self.analyzer_frequency = 100.0
 
     def calls_to(self, name):
         return [args for called, args in self.calls if called == name]
@@ -248,6 +260,37 @@ class FakeDwf:
         for i in range(nrx.value):
             rx[i] = memory[(register + i) % len(memory)]
         _set(nak, 0)
+
+    # analyzer engine
+    def _h_AnalogImpedanceFrequencySet(self, h, f): self.analyzer_frequency = f.value
+
+    def _h_AnalogImpedanceStatus(self, h, status):
+        if status is not None:
+            _set(status, 2)
+
+    def _transfer(self):
+        w = 2 * math.pi * self.analyzer_frequency
+        jwrc = 1j * w * self.analyzer_r * self.analyzer_c
+        return jwrc / (1 + jwrc)
+
+    def _h_AnalogImpedanceStatusInput(self, h, ch, gain, phase):
+        if ch.value == 0:
+            _set(gain, 1.0)
+            return
+        transfer = self._transfer()
+        _set(gain, 1 / abs(transfer))                   # engine reports C1/C2
+        if phase is not None:
+            _set(phase, -math.atan2(transfer.imag, transfer.real))
+
+    def _h_AnalogImpedanceStatusMeasure(self, h, measure, out):
+        w = 2 * math.pi * self.analyzer_frequency
+        r, x = self.analyzer_esr, -1 / (w * self.analyzer_c)
+        z = complex(r, x)
+        table = {0: abs(z), 1: math.atan2(x, r), 2: r, 3: x, 8: self.analyzer_c, 9: self.analyzer_c,
+                 10: x / w, 11: x / w, 12: r / abs(x), 13: abs(x) / r}
+        _set(out, table.get(measure.value, 0.0))
+
+    def _h_AnalogImpedanceStatusWarning(self, h, ch, out): _set(out, 0)
 
     def _h_DigitalI2cSpyStatus(self, h, start, stop, data, count, nak):
         if self.i2c_spy_fragments:
